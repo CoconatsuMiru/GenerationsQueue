@@ -1,6 +1,7 @@
 export interface Player {
   id: number;
   name: string;
+  partnerId: number | null;
 }
 
 export interface Court {
@@ -15,6 +16,7 @@ export interface DbPlayer {
   id: number;
   name: string;
   queue_position: number;
+  partner_id: number | null;
 }
 
 export interface DbCourt {
@@ -22,4 +24,9 @@ export interface DbCourt {
   name: string;
   player_ids: number[];
   start_time: string | null;
+}
+
+export interface DbSessionState {
+  id: number;
+  is_active: boolean;
 }

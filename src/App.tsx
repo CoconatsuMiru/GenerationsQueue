@@ -6,6 +6,74 @@ import CourtCard from './CourtCard';
 
 const GAME_LENGTH_MINUTES = 15; // configurable court time limit (hardcoded for now)
 const WARMUP_MINUTES = 3; // warmup period before the game timer starts
+const OVERTIME_MINUTES = 2; // grace period after game time expires, before auto-clearing
+const MAX_QUEUE_STACKS = 10; // how many upcoming groups-of-4 to display
+
+// Turns the flat, ordered player list into "units" — a solo player, or a
+// paired duo that must always travel together. A unit's position in the
+// list is wherever its first member appears in the original order.
+function buildUnits(players: Player[]): Player[][] {
+  const consumed = new Set<number>();
+  const units: Player[][] = [];
+
+  for (const player of players) {
+    if (consumed.has(player.id)) continue;
+
+    if (player.partnerId !== null) {
+      const partner = players.find((p) => p.id === player.partnerId);
+      if (partner && !consumed.has(partner.id)) {
+        units.push([player, partner]);
+        consumed.add(player.id);
+        consumed.add(partner.id);
+        continue;
+      }
+    }
+
+    units.push([player]);
+    consumed.add(player.id);
+  }
+
+  return units;
+}
+
+// Greedily fills a group up to `size` slots using whole units only — a pair
+// that doesn't fit in the remaining space is skipped and left for the next
+// group, rather than being split apart.
+function selectNextGroup(
+  units: Player[][],
+  size: number
+): { group: Player[]; remainingUnits: Player[][] } {
+  const group: Player[] = [];
+  const remaining = [...units];
+  let i = 0;
+
+  while (group.length < size && i < remaining.length) {
+    const unit = remaining[i];
+    if (unit.length <= size - group.length) {
+      group.push(...unit);
+      remaining.splice(i, 1);
+    } else {
+      i++;
+    }
+  }
+
+  return { group, remainingUnits: remaining };
+}
+
+// Repeatedly pulls groups of `size` from the units list, up to `maxGroups`.
+function buildQueueGroups(units: Player[][], size: number, maxGroups: number): Player[][] {
+  const groups: Player[][] = [];
+  let remainingUnits = units;
+
+  while (remainingUnits.length > 0 && groups.length < maxGroups) {
+    const { group, remainingUnits: rest } = selectNextGroup(remainingUnits, size);
+    if (group.length === 0) break;
+    groups.push(group);
+    remainingUnits = rest;
+  }
+
+  return groups;
+}
 
 function App() {
   const [players, setPlayers] = useState<Player[]>([]);
@@ -13,12 +81,19 @@ function App() {
 
   const [courts, setCourts] = useState<Court[]>([]);
 
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
 
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchInput, setBatchInput] = useState('');
 
+  const [showQueueSidebar, setShowQueueSidebar] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [pairingSourceId, setPairingSourceId] = useState<number | null>(null);
+
+  const [isSessionActive, setIsSessionActive] = useState(false);
+
   const isAssigning = useRef(false);
+  const autoEndingCourts = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     const intervalId = setInterval(() => {
@@ -39,12 +114,20 @@ function App() {
       .select('*')
       .order('id', { ascending: true });
 
+    const { data: dbSession, error: sessionError } = await supabase
+      .from('session_state')
+      .select('*')
+      .eq('id', 1)
+      .single();
+
     if (playersError) console.error('Error loading players:', playersError);
     if (courtsError) console.error('Error loading courts:', courtsError);
+    if (sessionError) console.error('Error loading session state:', sessionError);
 
     const allPlayers: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
       name: p.name,
+      partnerId: p.partner_id,
     }));
 
     const playingIds = new Set(
@@ -61,19 +144,26 @@ function App() {
 
     setPlayers(waitingPlayers);
     setCourts(mappedCourts);
+    if (dbSession) setIsSessionActive(dbSession.is_active);
   }
 
   useEffect(() => {
     loadData();
   }, []);
 
+  // Automatically fills the first open court with the next full group of 4,
+  // built from whole units (so pairs always stay together). Only runs while
+  // the session is active.
   useEffect(() => {
+    if (!isSessionActive) return;
+
     const openCourt = courts.find((court) => court.players.length === 0);
     if (!openCourt) return;
-    if (players.length < 4) return;
     if (isAssigning.current) return;
 
-    const nextFour = players.slice(0, 4);
+    const units = buildUnits(players);
+    const { group } = selectNextGroup(units, 4);
+    if (group.length < 4) return; // not enough waiting players to fill a full court
 
     async function assignCourt() {
       isAssigning.current = true;
@@ -81,7 +171,7 @@ function App() {
       const { error } = await supabase
         .from('courts')
         .update({
-          player_ids: nextFour.map((p) => p.id),
+          player_ids: group.map((p) => p.id),
           start_time: new Date().toISOString(),
         })
         .eq('id', openCourt.id);
@@ -93,7 +183,23 @@ function App() {
     }
 
     assignCourt();
-  }, [players, courts]);
+  }, [players, courts, isSessionActive]);
+
+  useEffect(() => {
+    const totalMs = (WARMUP_MINUTES + GAME_LENGTH_MINUTES + OVERTIME_MINUTES) * 60 * 1000;
+
+    courts.forEach((court) => {
+      if (court.startTime === null) return;
+      const elapsedMs = Date.now() - court.startTime;
+      if (elapsedMs < totalMs) return;
+      if (autoEndingCourts.current.has(court.id)) return;
+
+      autoEndingCourts.current.add(court.id);
+      handleEndGame(court.id).finally(() => {
+        autoEndingCourts.current.delete(court.id);
+      });
+    });
+  }, [tick, courts]);
 
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
@@ -109,7 +215,7 @@ function App() {
       return;
     }
 
-    const newPlayer: Player = { id: data.id, name: data.name };
+    const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
     setPlayers([...players, newPlayer]);
     setNameInput('');
   }
@@ -147,6 +253,7 @@ function App() {
     const newPlayers: Player[] = (data ?? []).map((p) => ({
       id: p.id,
       name: p.name,
+      partnerId: p.partner_id,
     }));
 
     setPlayers([...players, ...newPlayers]);
@@ -155,6 +262,16 @@ function App() {
   }
 
   async function handleRemovePlayer(id: number) {
+    const player = players.find((p) => p.id === id);
+
+    if (player?.partnerId !== null && player?.partnerId !== undefined) {
+      const { error: unpairError } = await supabase
+        .from('players')
+        .update({ partner_id: null })
+        .eq('id', player.partnerId);
+      if (unpairError) console.error('Error clearing partner link:', unpairError);
+    }
+
     const { error } = await supabase.from('players').delete().eq('id', id);
 
     if (error) {
@@ -162,27 +279,31 @@ function App() {
       return;
     }
 
-    setPlayers(players.filter((player) => player.id !== id));
+    setPlayers(
+      players
+        .filter((p) => p.id !== id)
+        .map((p) => (p.id === player?.partnerId ? { ...p, partnerId: null } : p))
+    );
   }
 
   async function handleSkipPlayer(id: number) {
-    const newPosition = Date.now();
-
-    const { error } = await supabase
-      .from('players')
-      .update({ queue_position: newPosition })
-      .eq('id', id);
-
-    if (error) {
-      console.error('Error skipping player:', error);
-      return;
-    }
-
     const player = players.find((p) => p.id === id);
     if (!player) return;
 
-    const withoutPlayer = players.filter((p) => p.id !== id);
-    setPlayers([...withoutPlayer, player]);
+    const idsToSkip = player.partnerId !== null ? [id, player.partnerId] : [id];
+    const now = Date.now();
+
+    for (let i = 0; i < idsToSkip.length; i++) {
+      const { error } = await supabase
+        .from('players')
+        .update({ queue_position: now + i })
+        .eq('id', idsToSkip[i]);
+      if (error) console.error('Error skipping player:', error);
+    }
+
+    const skipped = players.filter((p) => idsToSkip.includes(p.id));
+    const remaining = players.filter((p) => !idsToSkip.includes(p.id));
+    setPlayers([...remaining, ...skipped]);
   }
 
   async function handleEndGame(courtId: number) {
@@ -231,15 +352,84 @@ function App() {
       .update({ player_ids: [], start_time: null })
       .neq('id', 0);
 
+    const { error: resetSessionError } = await supabase
+      .from('session_state')
+      .update({ is_active: false })
+      .eq('id', 1);
+
     if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
     if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
+    if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
 
     await loadData();
   }
 
-  const nextUp = players.slice(0, 4);
-  const restOfQueue = players.slice(4);
+  // Toggles the session between active (auto-assign runs) and paused
+  // (organizer can still add/manage players, but no auto-fill happens).
+  async function handleToggleSession() {
+    const newValue = !isSessionActive;
+
+    const { error } = await supabase
+      .from('session_state')
+      .update({ is_active: newValue })
+      .eq('id', 1);
+
+    if (error) {
+      console.error('Error updating session state:', error);
+      return;
+    }
+
+    setIsSessionActive(newValue);
+  }
+
+  async function handlePairPlayers(idA: number, idB: number) {
+    if (idA === idB) return;
+
+    const { error: errA } = await supabase.from('players').update({ partner_id: idB }).eq('id', idA);
+    const { error: errB } = await supabase.from('players').update({ partner_id: idA }).eq('id', idB);
+
+    if (errA || errB) {
+      console.error('Error pairing players:', errA || errB);
+      return;
+    }
+
+    setPlayers(
+      players.map((p) => {
+        if (p.id === idA) return { ...p, partnerId: idB };
+        if (p.id === idB) return { ...p, partnerId: idA };
+        return p;
+      })
+    );
+    setPairingSourceId(null);
+  }
+
+  async function handleUnpairPlayer(id: number) {
+    const player = players.find((p) => p.id === id);
+    if (!player || player.partnerId === null) return;
+
+    const partnerId = player.partnerId;
+
+    const { error: errA } = await supabase.from('players').update({ partner_id: null }).eq('id', id);
+    const { error: errB } = await supabase.from('players').update({ partner_id: null }).eq('id', partnerId);
+
+    if (errA || errB) {
+      console.error('Error unpairing players:', errA || errB);
+      return;
+    }
+
+    setPlayers(
+      players.map((p) => (p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p))
+    );
+  }
+
+  const units = buildUnits(players);
+  const nextUp = buildQueueGroups(units, 4, 1)[0] ?? [];
+  const queueStacks = buildQueueGroups(units, 4, MAX_QUEUE_STACKS);
   const courtsInPlay = courts.filter((c) => c.players.length > 0).length;
+
+  const filteredUnits = units.filter((unit) =>
+    unit.some((p) => p.name.toLowerCase().includes(searchTerm.trim().toLowerCase()))
+  );
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -264,7 +454,16 @@ function App() {
                 </svg>
               </div>
               <div>
-                <h1 className="text-2xl font-extrabold text-white tracking-tight">PickleQueue</h1>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-2xl font-extrabold text-white tracking-tight">PickleQueue</h1>
+                  <span
+                    className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                      isSessionActive ? 'bg-white/25 text-white' : 'bg-black/20 text-white/80'
+                    }`}
+                  >
+                    {isSessionActive ? '● LIVE' : 'PAUSED'}
+                  </span>
+                </div>
                 <p className="text-green-100 text-xs font-medium">Digital paddle board & queue</p>
               </div>
             </div>
@@ -291,6 +490,27 @@ function App() {
                 + Multiple
               </button>
               <button
+                onClick={() => setShowQueueSidebar(true)}
+                className="relative bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+              >
+                Manage Queue
+                {players.length > 0 && (
+                  <span className="absolute -top-2 -right-2 bg-white text-green-700 text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center">
+                    {players.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={handleToggleSession}
+                className={`font-semibold text-sm px-4 py-2 rounded-lg border transition-colors ${
+                  isSessionActive
+                    ? 'bg-white/15 hover:bg-yellow-500/80 text-white border-white/30'
+                    : 'bg-white text-green-700 hover:bg-green-50 border-white'
+                }`}
+              >
+                {isSessionActive ? 'Pause Session' : 'Start Session'}
+              </button>
+              <button
                 onClick={handleResetSession}
                 className="bg-white/15 hover:bg-red-500/80 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
@@ -302,6 +522,15 @@ function App() {
       </header>
 
       <div className="max-w-6xl mx-auto px-6 py-6">
+        {!isSessionActive && (
+          <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm font-medium rounded-lg px-4 py-3 mb-6 flex items-center gap-2">
+            <span>⏸</span>
+            <span>
+              Session is paused — players can be added and managed, but courts won't auto-fill until you click "Start Session."
+            </span>
+          </div>
+        )}
+
         {/* Stat strip */}
         <div className="grid grid-cols-3 gap-4 mb-6">
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
@@ -329,15 +558,15 @@ function App() {
                   court={court}
                   gameLengthMinutes={GAME_LENGTH_MINUTES}
                   warmupMinutes={WARMUP_MINUTES}
+                  overtimeMinutes={OVERTIME_MINUTES}
                   onEndGame={handleEndGame}
                 />
               ))}
             </div>
           </div>
 
-          {/* Right: Queue */}
-          <div className="space-y-5">
-            {/* Next Up */}
+          {/* Right: Next Up only */}
+          <div>
             <div className="bg-linear-to-br from-green-500 to-emerald-600 text-white rounded-xl shadow-md p-5">
               <div className="flex items-center gap-2 mb-3">
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -358,85 +587,73 @@ function App() {
                         {index + 1}
                       </span>
                       <span className="font-medium text-sm truncate">{player.name}</span>
+                      {player.partnerId !== null && <span className="text-xs">🔗</span>}
                     </li>
                   ))}
                 </ul>
               )}
             </div>
-
-            {/* Rest of Queue */}
-            <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-5">
-              <details>
-                <summary className="text-sm font-bold text-gray-700 cursor-pointer select-none flex items-center justify-between">
-                  <span>Rest of Queue</span>
-                  {restOfQueue.length > 0 && (
-                    <span className="bg-gray-100 text-gray-500 text-xs font-bold px-2 py-0.5 rounded-full">
-                      {restOfQueue.length}
-                    </span>
-                  )}
-                </summary>
-                <div className="mt-3">
-                  {restOfQueue.length === 0 ? (
-                    <p className="text-gray-300 text-sm">—</p>
-                  ) : (
-                    <ul className="space-y-1 max-h-64 overflow-y-auto">
-                      {restOfQueue.map((player, i) => (
-                        <li key={player.id} className="text-sm text-gray-600 px-2 py-1.5 flex items-center gap-2">
-                          <span className="text-gray-300 text-xs w-4">{i + 5}</span>
-                          {player.name}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              </details>
-            </div>
-
-            {/* Full waiting queue with actions */}
-            <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-5">
-              <details open>
-                <summary className="text-sm font-bold text-gray-700 cursor-pointer select-none flex items-center justify-between">
-                  <span>Waiting Queue</span>
-                  {players.length > 0 && (
-                    <span className="bg-gray-100 text-gray-500 text-xs font-bold px-2 py-0.5 rounded-full">
-                      {players.length}
-                    </span>
-                  )}
-                </summary>
-                <div className="mt-3">
-                  {players.length === 0 ? (
-                    <p className="text-gray-300 text-sm">No players waiting</p>
-                  ) : (
-                    <ul className="space-y-2 max-h-64 overflow-y-auto">
-                      {players.map((player) => (
-                        <li
-                          key={player.id}
-                          className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
-                        >
-                          <span className="text-gray-800 text-sm font-medium truncate">{player.name}</span>
-                          <div className="flex gap-1.5 shrink-0 ml-2">
-                            <button
-                              onClick={() => handleSkipPlayer(player.id)}
-                              className="text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              Skip
-                            </button>
-                            <button
-                              onClick={() => handleRemovePlayer(player.id)}
-                              className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              Remove
-                            </button>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              </details>
-            </div>
           </div>
         </div>
+
+        {/* Queue Stacks row — horizontal scroll of upcoming groups-of-4 */}
+        {queueStacks.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
+              Upcoming Stacks
+            </h2>
+            <div className="flex gap-4 overflow-x-auto pb-2">
+              {queueStacks.map((stack, stackIndex) => (
+                <div
+                  key={stackIndex}
+                  className={`shrink-0 w-56 rounded-xl shadow-sm p-4 ${
+                    stackIndex === 0
+                      ? 'bg-linear-to-br from-green-500 to-emerald-600 text-white'
+                      : 'bg-white/90 backdrop-blur text-gray-800'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-3">
+                    <span
+                      className={`text-xs font-bold uppercase tracking-wide ${
+                        stackIndex === 0 ? 'text-green-100' : 'text-gray-400'
+                      }`}
+                    >
+                      Stack {stackIndex + 1}
+                    </span>
+                    {stackIndex === 0 && (
+                      <span className="text-[10px] font-bold bg-white/25 px-2 py-0.5 rounded-full">
+                        NEXT
+                      </span>
+                    )}
+                  </div>
+                  <ul className="space-y-1.5">
+                    {stack.map((player, i) => (
+                      <li
+                        key={player.id}
+                        className={`text-sm font-medium truncate rounded-md px-2 py-1 flex items-center gap-1 ${
+                          stackIndex === 0 ? 'bg-white/15' : 'bg-gray-50'
+                        }`}
+                      >
+                        <span>{i + 1}. {player.name}</span>
+                        {player.partnerId !== null && <span className="text-xs">🔗</span>}
+                      </li>
+                    ))}
+                    {Array.from({ length: 4 - stack.length }).map((_, i) => (
+                      <li
+                        key={`empty-${i}`}
+                        className={`text-sm rounded-md px-2 py-1 ${
+                          stackIndex === 0 ? 'text-green-200/60' : 'text-gray-300'
+                        }`}
+                      >
+                        —
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Batch add modal */}
@@ -469,6 +686,175 @@ function App() {
               >
                 Add Players
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Queue management sidebar drawer */}
+      {showQueueSidebar && (
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <div
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            onClick={() => {
+              setShowQueueSidebar(false);
+              setPairingSourceId(null);
+            }}
+          />
+
+          <div className="relative w-full max-w-sm bg-white h-full shadow-2xl overflow-y-auto animate-modal-in flex flex-col">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 sticky top-0 bg-white z-10">
+              <h2 className="text-lg font-bold text-gray-800">Manage Queue</h2>
+              <button
+                onClick={() => {
+                  setShowQueueSidebar(false);
+                  setPairingSourceId(null);
+                }}
+                className="text-gray-400 hover:text-gray-600 w-8 h-8 rounded-full hover:bg-gray-100 flex items-center justify-center transition-colors"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Search bar */}
+            <div className="px-5 pt-4">
+              <div className="relative">
+                <svg className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <circle cx="11" cy="11" r="7" />
+                  <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
+                </svg>
+                <input
+                  type="text"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Search players..."
+                  className="w-full border border-gray-200 rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                />
+              </div>
+            </div>
+
+            {/* Pairing mode banner */}
+            {pairingSourceId !== null && (
+              <div className="mx-5 mt-3 bg-green-50 border border-green-200 rounded-lg px-3 py-2 flex items-center justify-between">
+                <p className="text-xs font-medium text-green-700">
+                  Tap another player to pair with{' '}
+                  {players.find((p) => p.id === pairingSourceId)?.name}
+                </p>
+                <button
+                  onClick={() => setPairingSourceId(null)}
+                  className="text-xs font-semibold text-green-700 hover:text-green-900 ml-2 shrink-0"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            <div className="p-5">
+              <h3 className="text-sm font-bold text-gray-700 mb-3 flex items-center justify-between">
+                <span>Waiting Queue</span>
+                {players.length > 0 && (
+                  <span className="bg-gray-100 text-gray-500 text-xs font-bold px-2 py-0.5 rounded-full">
+                    {players.length}
+                  </span>
+                )}
+              </h3>
+
+              {filteredUnits.length === 0 ? (
+                <p className="text-gray-300 text-sm">
+                  {players.length === 0 ? 'No players waiting' : 'No matches'}
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {filteredUnits.map((unit) =>
+                    unit.length === 2 ? (
+                      <li
+                        key={`pair-${unit[0].id}-${unit[1].id}`}
+                        className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2"
+                      >
+                        <div className="flex items-center gap-1 text-xs font-semibold text-purple-600 mb-1.5">
+                          <span>🔗</span>
+                          <span>Paired</span>
+                        </div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
+                        </div>
+                        <div className="flex gap-1.5 mt-2">
+                          <button
+                            onClick={() => handleSkipPlayer(unit[0].id)}
+                            className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Skip Pair
+                          </button>
+                          <button
+                            onClick={() => handleUnpairPlayer(unit[0].id)}
+                            className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Unpair
+                          </button>
+                          <button
+                            onClick={() => handleRemovePlayer(unit[0].id)}
+                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            ✕
+                          </button>
+                          <button
+                            onClick={() => handleRemovePlayer(unit[1].id)}
+                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </li>
+                    ) : (
+                      <li
+                        key={unit[0].id}
+                        className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
+                      >
+                        <span className="text-gray-800 text-sm font-medium truncate">{unit[0].name}</span>
+                        <div className="flex gap-1.5 shrink-0 ml-2">
+                          {pairingSourceId === unit[0].id ? (
+                            <button
+                              onClick={() => setPairingSourceId(null)}
+                              className="text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Cancel
+                            </button>
+                          ) : pairingSourceId !== null ? (
+                            <button
+                              onClick={() => handlePairPlayers(pairingSourceId, unit[0].id)}
+                              className="text-xs font-semibold bg-green-100 hover:bg-green-200 text-green-700 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Pair Here
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => setPairingSourceId(unit[0].id)}
+                              className="text-xs font-semibold bg-purple-50 hover:bg-purple-100 text-purple-600 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              🔗 Pair
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleSkipPlayer(unit[0].id)}
+                            className="text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Skip
+                          </button>
+                          <button
+                            onClick={() => handleRemovePlayer(unit[0].id)}
+                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </li>
+                    )
+                  )}
+                </ul>
+              )}
             </div>
           </div>
         </div>
