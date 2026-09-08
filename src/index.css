@@ -1,1 +1,36 @@
 @import "tailwindcss";
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.animate-modal-in {
+  animation: modal-in 0.15s ease-out;
+}
+
+@keyframes blob-float {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, -20px) scale(1.05); }
+  66% { transform: translate(-20px, 20px) scale(0.95); }
+}
+
+.animate-blob {
+  animation: blob-float 12s ease-in-out infinite;
+}
+
+.animate-blob-delayed {
+  animation: blob-float 14s ease-in-out infinite;
+  animation-delay: -6s;
+}
+
+.bg-dot-grid {
+  background-image: radial-gradient(circle, #00000020 1.5px, transparent 1.5px);
+  background-size: 22px 22px;
+}
