@@ -151,9 +151,6 @@ function App() {
     loadData();
   }, []);
 
-  // Automatically fills the first open court with the next full group of 4,
-  // built from whole units (so pairs always stay together). Only runs while
-  // the session is active.
   useEffect(() => {
     if (!isSessionActive) return;
 
@@ -163,7 +160,7 @@ function App() {
 
     const units = buildUnits(players);
     const { group } = selectNextGroup(units, 4);
-    if (group.length < 4) return; // not enough waiting players to fill a full court
+    if (group.length < 4) return;
 
     async function assignCourt() {
       isAssigning.current = true;
@@ -364,8 +361,6 @@ function App() {
     await loadData();
   }
 
-  // Toggles the session between active (auto-assign runs) and paused
-  // (organizer can still add/manage players, but no auto-fill happens).
   async function handleToggleSession() {
     const newValue = !isSessionActive;
 
@@ -423,7 +418,6 @@ function App() {
   }
 
   const units = buildUnits(players);
-  const nextUp = buildQueueGroups(units, 4, 1)[0] ?? [];
   const queueStacks = buildQueueGroups(units, 4, MAX_QUEUE_STACKS);
   const courtsInPlay = courts.filter((c) => c.players.length > 0).length;
 
@@ -547,52 +541,20 @@ function App() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: Courts */}
-          <div className="lg:col-span-2">
-            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {courts.map((court) => (
-                <CourtCard
-                  key={court.id}
-                  court={court}
-                  gameLengthMinutes={GAME_LENGTH_MINUTES}
-                  warmupMinutes={WARMUP_MINUTES}
-                  overtimeMinutes={OVERTIME_MINUTES}
-                  onEndGame={handleEndGame}
-                />
-              ))}
-            </div>
-          </div>
-
-          {/* Right: Next Up only */}
-          <div>
-            <div className="bg-linear-to-br from-green-500 to-emerald-600 text-white rounded-xl shadow-md p-5">
-              <div className="flex items-center gap-2 mb-3">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 7l5 5-5 5M6 7l5 5-5 5" />
-                </svg>
-                <h2 className="text-base font-bold">Next Up</h2>
-              </div>
-              {nextUp.length === 0 ? (
-                <p className="text-green-100 text-sm">No one waiting</p>
-              ) : (
-                <ul className="space-y-2">
-                  {nextUp.map((player, index) => (
-                    <li
-                      key={player.id}
-                      className="bg-white/15 backdrop-blur rounded-lg px-3 py-2 flex items-center gap-3"
-                    >
-                      <span className="bg-white/25 text-white font-bold text-xs w-5 h-5 rounded-full flex items-center justify-center shrink-0">
-                        {index + 1}
-                      </span>
-                      <span className="font-medium text-sm truncate">{player.name}</span>
-                      {player.partnerId !== null && <span className="text-xs">🔗</span>}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+        {/* Courts — now full width */}
+        <div>
+          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {courts.map((court) => (
+              <CourtCard
+                key={court.id}
+                court={court}
+                gameLengthMinutes={GAME_LENGTH_MINUTES}
+                warmupMinutes={WARMUP_MINUTES}
+                overtimeMinutes={OVERTIME_MINUTES}
+                onEndGame={handleEndGame}
+              />
+            ))}
           </div>
         </div>
 
