@@ -4,11 +4,12 @@ import type { Player, Court } from './types';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
 import AuthPage from './AuthPage';
+import AdminPage from './AdminPage';
 import type { Session } from '@supabase/supabase-js';
 
-const GAME_LENGTH_MINUTES = .2;
-const WARMUP_MINUTES = .2;
-const OVERTIME_MINUTES = .2;
+const GAME_LENGTH_MINUTES = 15;
+const WARMUP_MINUTES = 3;
+const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 
 function buildUnits(players: Player[]): Player[][] {
@@ -73,6 +74,7 @@ function buildQueueGroups(units: Player[][], size: number, maxGroups: number): P
 function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState<'dashboard' | 'admin'>('dashboard');
 
   const [players, setPlayers] = useState<Player[]>([]);
   const [nameInput, setNameInput] = useState('');
@@ -114,9 +116,6 @@ function App() {
     return () => clearInterval(intervalId);
   }, []);
 
-  // Loads (or, for a brand-new account, creates) this user's own courts and
-  // session_state row, then fetches players/courts scoped to their owner_id.
-  // Includes explicit error logging so we can see exactly what's failing.
   async function loadData() {
     const userId = session?.user.id;
     if (!userId) return;
@@ -137,7 +136,6 @@ function App() {
     if (existingSession) {
       sessionActive = existingSession.is_active;
     } else {
-      console.warn('No session_state row found for this user — creating one now.');
       const { data: created, error: createError } = await supabase
         .from('session_state')
         .insert({ owner_id: userId, is_active: false })
@@ -211,6 +209,38 @@ function App() {
     }
   }, [session]);
 
+  // Subscribes to live database changes for this user's courts, players,
+  // and session_state. Any insert/update/delete — from this tab, another
+  // tab, or the Admin page — triggers a fresh loadData() automatically,
+  // so the dashboard never needs a manual reload to stay in sync.
+  useEffect(() => {
+    const userId = session?.user.id;
+    if (!userId) return;
+
+    const channel = supabase
+      .channel('dashboard-changes')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'courts', filter: `owner_id=eq.${userId}` },
+        () => loadData()
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'players', filter: `owner_id=eq.${userId}` },
+        () => loadData()
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'session_state', filter: `owner_id=eq.${userId}` },
+        () => loadData()
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [session]);
+
   useEffect(() => {
     if (!isSessionActive) return;
 
@@ -235,7 +265,8 @@ function App() {
 
       if (error) console.error('Error assigning court:', error);
 
-      await loadData();
+      // No need to manually call loadData() here anymore — the realtime
+      // subscription above will pick up this write and refresh state.
       isAssigning.current = false;
     }
 
@@ -426,8 +457,6 @@ function App() {
     if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
     if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
     if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
-
-    await loadData();
   }
 
   async function handleToggleSession() {
@@ -445,8 +474,6 @@ function App() {
       console.error('Error updating session state:', error);
       return;
     }
-
-    setIsSessionActive(newValue);
   }
 
   async function handlePairPlayers(idA: number, idB: number) {
@@ -499,6 +526,10 @@ function App() {
 
   if (!session) {
     return <AuthPage />;
+  }
+
+  if (currentPage === 'admin') {
+    return <AdminPage onBack={() => setCurrentPage('dashboard')} />;
   }
 
   const units = buildUnits(players);
@@ -591,6 +622,12 @@ function App() {
                 className="bg-white/15 hover:bg-red-500/80 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 Reset
+              </button>
+              <button
+                onClick={() => setCurrentPage('admin')}
+                className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+              >
+                ⚙ Settings
               </button>
               <button
                 onClick={() => supabase.auth.signOut()}

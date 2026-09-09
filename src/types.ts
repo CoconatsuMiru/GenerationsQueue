@@ -11,6 +11,12 @@ export interface Court {
   startTime: number | null; // timestamp (ms) when the current game started, or null if idle
 }
 
+export interface VenueSettings {
+  warmupMinutes: number;
+  gameMinutes: number;
+  overtimeMinutes: number;
+}
+
 // Shapes matching the actual Supabase table rows
 export interface DbPlayer {
   id: number;
@@ -27,6 +33,13 @@ export interface DbCourt {
 }
 
 export interface DbSessionState {
-  id: number;
+  owner_id: string;
   is_active: boolean;
+}
+
+export interface DbVenueSettings {
+  owner_id: string;
+  warmup_minutes: number;
+  game_minutes: number;
+  overtime_minutes: number;
 }
