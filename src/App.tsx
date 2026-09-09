@@ -209,34 +209,46 @@ function App() {
     }
   }, [session]);
 
-  // Subscribes to live database changes for this user's courts, players,
-  // and session_state. Any insert/update/delete — from this tab, another
-  // tab, or the Admin page — triggers a fresh loadData() automatically,
-  // so the dashboard never needs a manual reload to stay in sync.
+    // Subscribes to live database changes for this user's courts, players,
+  // and session_state. Multiple changes arriving close together (e.g. a
+  // court clearing plus several players being requeued) are debounced into
+  // a single loadData() call, instead of reloading once per event — that
+  // debounce is what stops the dashboard from flickering through
+  // half-updated states while a multi-step action is still in progress.
   useEffect(() => {
     const userId = session?.user.id;
     if (!userId) return;
+
+    let debounceTimer: ReturnType<typeof setTimeout>;
+
+    function scheduleReload() {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        loadData();
+      }, 250);
+    }
 
     const channel = supabase
       .channel('dashboard-changes')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'courts', filter: `owner_id=eq.${userId}` },
-        () => loadData()
+        scheduleReload
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'players', filter: `owner_id=eq.${userId}` },
-        () => loadData()
+        scheduleReload
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'session_state', filter: `owner_id=eq.${userId}` },
-        () => loadData()
+        scheduleReload
       )
       .subscribe();
 
     return () => {
+      clearTimeout(debounceTimer);
       supabase.removeChannel(channel);
     };
   }, [session]);
@@ -400,7 +412,7 @@ function App() {
     setPlayers([...remaining, ...skipped]);
   }
 
-  async function handleEndGame(courtId: number) {
+async function handleEndGame(courtId: number) {
     const court = courts.find((c) => c.id === courtId);
     if (!court) return;
 
@@ -411,15 +423,21 @@ function App() {
 
     if (courtError) console.error('Error ending game:', courtError);
 
+    // Requeue every player in a single batched write instead of one
+    // sequential update per player — this cuts a 4-player end-game from
+    // 5 separate database writes (and 5 realtime events) down to 2.
     const now = Date.now();
-    for (let i = 0; i < court.players.length; i++) {
-      const player = court.players[i];
-      const { error: playerError } = await supabase
-        .from('players')
-        .update({ queue_position: now + i })
-        .eq('id', player.id);
+    const requeueRows = court.players.map((player, i) => ({
+      id: player.id,
+      queue_position: now + i,
+    }));
 
-      if (playerError) console.error('Error requeuing player:', playerError);
+    if (requeueRows.length > 0) {
+      const { error: requeueError } = await supabase
+        .from('players')
+        .upsert(requeueRows, { onConflict: 'id' });
+
+      if (requeueError) console.error('Error requeuing players:', requeueError);
     }
 
     setPlayers([...players, ...court.players]);
@@ -428,7 +446,7 @@ function App() {
         c.id === courtId ? { ...c, players: [], startTime: null } : c
       )
     );
-  }
+}
 
   async function handleResetSession() {
     const userId = session?.user.id;
