@@ -3,15 +3,14 @@ import './App.css';
 import type { Player, Court } from './types';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
+import AuthPage from './AuthPage';
+import type { Session } from '@supabase/supabase-js';
 
-const GAME_LENGTH_MINUTES = 15; // configurable court time limit (hardcoded for now)
-const WARMUP_MINUTES = 3; // warmup period before the game timer starts
-const OVERTIME_MINUTES = 2; // grace period after game time expires, before auto-clearing
-const MAX_QUEUE_STACKS = 10; // how many upcoming groups-of-4 to display
+const GAME_LENGTH_MINUTES = .2;
+const WARMUP_MINUTES = .2;
+const OVERTIME_MINUTES = .2;
+const MAX_QUEUE_STACKS = 10;
 
-// Turns the flat, ordered player list into "units" — a solo player, or a
-// paired duo that must always travel together. A unit's position in the
-// list is wherever its first member appears in the original order.
 function buildUnits(players: Player[]): Player[][] {
   const consumed = new Set<number>();
   const units: Player[][] = [];
@@ -36,9 +35,6 @@ function buildUnits(players: Player[]): Player[][] {
   return units;
 }
 
-// Greedily fills a group up to `size` slots using whole units only — a pair
-// that doesn't fit in the remaining space is skipped and left for the next
-// group, rather than being split apart.
 function selectNextGroup(
   units: Player[][],
   size: number
@@ -60,7 +56,6 @@ function selectNextGroup(
   return { group, remainingUnits: remaining };
 }
 
-// Repeatedly pulls groups of `size` from the units list, up to `maxGroups`.
 function buildQueueGroups(units: Player[][], size: number, maxGroups: number): Player[][] {
   const groups: Player[][] = [];
   let remainingUnits = units;
@@ -76,6 +71,9 @@ function buildQueueGroups(units: Player[][], size: number, maxGroups: number): P
 }
 
 function App() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [players, setPlayers] = useState<Player[]>([]);
   const [nameInput, setNameInput] = useState('');
 
@@ -96,6 +94,19 @@ function App() {
   const autoEndingCourts = useRef<Set<number>>(new Set());
 
   useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
     const intervalId = setInterval(() => {
       setTick((t) => t + 1);
     }, 1000);
@@ -103,26 +114,73 @@ function App() {
     return () => clearInterval(intervalId);
   }, []);
 
+  // Loads (or, for a brand-new account, creates) this user's own courts and
+  // session_state row, then fetches players/courts scoped to their owner_id.
+  // Includes explicit error logging so we can see exactly what's failing.
   async function loadData() {
+    const userId = session?.user.id;
+    if (!userId) return;
+
+    const { data: existingSession, error: sessionReadError } = await supabase
+      .from('session_state')
+      .select('*')
+      .eq('owner_id', userId)
+      .maybeSingle();
+
+    if (sessionReadError) {
+      console.error('SESSION READ ERROR:', sessionReadError);
+    }
+
+    let sessionActive = false;
+    let isNewAccount = false;
+
+    if (existingSession) {
+      sessionActive = existingSession.is_active;
+    } else {
+      console.warn('No session_state row found for this user — creating one now.');
+      const { data: created, error: createError } = await supabase
+        .from('session_state')
+        .insert({ owner_id: userId, is_active: false })
+        .select()
+        .single();
+
+      if (createError) {
+        console.error('SESSION CREATE ERROR:', createError);
+      }
+
+      sessionActive = created?.is_active ?? false;
+      isNewAccount = true;
+    }
+
+    if (isNewAccount) {
+      const { data: existingCourts } = await supabase
+        .from('courts')
+        .select('id')
+        .eq('owner_id', userId);
+
+      if (!existingCourts || existingCourts.length === 0) {
+        const { error: createCourtsError } = await supabase.from('courts').insert([
+          { owner_id: userId, name: 'Court 1', player_ids: [], start_time: null },
+          { owner_id: userId, name: 'Court 2', player_ids: [], start_time: null },
+        ]);
+        if (createCourtsError) console.error('Error creating starter courts:', createCourtsError);
+      }
+    }
+
     const { data: dbPlayers, error: playersError } = await supabase
       .from('players')
       .select('*')
+      .eq('owner_id', userId)
       .order('queue_position', { ascending: true });
 
     const { data: dbCourts, error: courtsError } = await supabase
       .from('courts')
       .select('*')
+      .eq('owner_id', userId)
       .order('id', { ascending: true });
-
-    const { data: dbSession, error: sessionError } = await supabase
-      .from('session_state')
-      .select('*')
-      .eq('id', 1)
-      .single();
 
     if (playersError) console.error('Error loading players:', playersError);
     if (courtsError) console.error('Error loading courts:', courtsError);
-    if (sessionError) console.error('Error loading session state:', sessionError);
 
     const allPlayers: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
@@ -144,12 +202,14 @@ function App() {
 
     setPlayers(waitingPlayers);
     setCourts(mappedCourts);
-    if (dbSession) setIsSessionActive(dbSession.is_active);
+    setIsSessionActive(sessionActive);
   }
 
   useEffect(() => {
-    loadData();
-  }, []);
+    if (session) {
+      loadData();
+    }
+  }, [session]);
 
   useEffect(() => {
     if (!isSessionActive) return;
@@ -200,10 +260,12 @@ function App() {
 
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
+    const userId = session?.user.id;
+    if (!userId) return;
 
     const { data, error } = await supabase
       .from('players')
-      .insert({ name: nameInput, queue_position: Date.now() })
+      .insert({ name: nameInput, queue_position: Date.now(), owner_id: userId })
       .select()
       .single();
 
@@ -224,6 +286,9 @@ function App() {
   }
 
   async function handleAddBatchPlayers() {
+    const userId = session?.user.id;
+    if (!userId) return;
+
     const names = batchInput
       .split(',')
       .map((name) => name.trim())
@@ -235,6 +300,7 @@ function App() {
     const rowsToInsert = names.map((name, index) => ({
       name,
       queue_position: now + index,
+      owner_id: userId,
     }));
 
     const { data, error } = await supabase
@@ -334,6 +400,9 @@ function App() {
   }
 
   async function handleResetSession() {
+    const userId = session?.user.id;
+    if (!userId) return;
+
     const confirmed = window.confirm(
       'Reset the entire session? This will remove all players and clear all courts.'
     );
@@ -342,17 +411,17 @@ function App() {
     const { error: deletePlayersError } = await supabase
       .from('players')
       .delete()
-      .neq('id', 0);
+      .eq('owner_id', userId);
 
     const { error: resetCourtsError } = await supabase
       .from('courts')
       .update({ player_ids: [], start_time: null })
-      .neq('id', 0);
+      .eq('owner_id', userId);
 
     const { error: resetSessionError } = await supabase
       .from('session_state')
       .update({ is_active: false })
-      .eq('id', 1);
+      .eq('owner_id', userId);
 
     if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
     if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
@@ -362,12 +431,15 @@ function App() {
   }
 
   async function handleToggleSession() {
+    const userId = session?.user.id;
+    if (!userId) return;
+
     const newValue = !isSessionActive;
 
     const { error } = await supabase
       .from('session_state')
       .update({ is_active: newValue })
-      .eq('id', 1);
+      .eq('owner_id', userId);
 
     if (error) {
       console.error('Error updating session state:', error);
@@ -417,6 +489,18 @@ function App() {
     );
   }
 
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-100">
+        <p className="text-gray-400 text-sm">Loading...</p>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <AuthPage />;
+  }
+
   const units = buildUnits(players);
   const queueStacks = buildQueueGroups(units, 4, MAX_QUEUE_STACKS);
   const courtsInPlay = courts.filter((c) => c.players.length > 0).length;
@@ -427,7 +511,6 @@ function App() {
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
-      {/* Decorative background layer */}
       <div className="fixed inset-0 -z-10 overflow-hidden">
         <div className="absolute inset-0 bg-dot-grid opacity-60" />
         <div className="animate-blob absolute -top-24 -left-24 w-[28rem] h-[28rem] bg-green-400 rounded-full blur-3xl opacity-50" />
@@ -436,7 +519,6 @@ function App() {
         <div className="animate-blob-delayed absolute bottom-1/4 right-1/4 w-80 h-80 bg-lime-300 rounded-full blur-3xl opacity-30" />
       </div>
 
-      {/* Header */}
       <header className="bg-linear-to-r from-green-600 to-emerald-600 shadow-lg">
         <div className="max-w-6xl mx-auto px-6 py-5">
           <div className="flex items-center justify-between flex-wrap gap-4">
@@ -510,6 +592,12 @@ function App() {
               >
                 Reset
               </button>
+              <button
+                onClick={() => supabase.auth.signOut()}
+                className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+              >
+                Log Out
+              </button>
             </div>
           </div>
         </div>
@@ -525,7 +613,6 @@ function App() {
           </div>
         )}
 
-        {/* Stat strip */}
         <div className="grid grid-cols-3 gap-4 mb-6">
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
             <p className="text-3xl font-extrabold text-gray-800">{courtsInPlay}/{courts.length}</p>
@@ -541,7 +628,6 @@ function App() {
           </div>
         </div>
 
-        {/* Courts — now full width */}
         <div>
           <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -558,7 +644,6 @@ function App() {
           </div>
         </div>
 
-        {/* Queue Stacks row — horizontal scroll of upcoming groups-of-4 */}
         {queueStacks.length > 0 && (
           <div className="mt-8">
             <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
@@ -618,7 +703,6 @@ function App() {
         )}
       </div>
 
-      {/* Batch add modal */}
       {showBatchModal && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md animate-modal-in">
@@ -653,7 +737,6 @@ function App() {
         </div>
       )}
 
-      {/* Queue management sidebar drawer */}
       {showQueueSidebar && (
         <div className="fixed inset-0 z-50 flex justify-end">
           <div
@@ -680,7 +763,6 @@ function App() {
               </button>
             </div>
 
-            {/* Search bar */}
             <div className="px-5 pt-4">
               <div className="relative">
                 <svg className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -697,7 +779,6 @@ function App() {
               </div>
             </div>
 
-            {/* Pairing mode banner */}
             {pairingSourceId !== null && (
               <div className="mx-5 mt-3 bg-green-50 border border-green-200 rounded-lg px-3 py-2 flex items-center justify-between">
                 <p className="text-xs font-medium text-green-700">
