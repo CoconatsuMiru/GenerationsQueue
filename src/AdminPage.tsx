@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { supabase } from './supabaseClient';
 import type { VenueSettings, Court } from './types';
 
-interface AdminPageProps {
-  onBack: () => void;
-}
+function AdminPage() {
+  const navigate = useNavigate();
 
-function AdminPage({ onBack }: AdminPageProps) {
   const [settings, setSettings] = useState<VenueSettings>({
     warmupMinutes: 3,
     gameMinutes: 15,
@@ -78,11 +77,10 @@ function AdminPage({ onBack }: AdminPageProps) {
     const mapped: Court[] = (data ?? []).map((c) => ({
       id: c.id,
       name: c.name,
-      players: [], // AdminPage only needs occupancy, not player details — see occupiedCourtIds below
+      players: [],
       startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
 
-    // Track occupancy directly from player_ids length, since we didn't join players here.
     const occupied = new Set(
       (data ?? []).filter((c) => (c.player_ids ?? []).length > 0).map((c) => c.id)
     );
@@ -164,7 +162,7 @@ function AdminPage({ onBack }: AdminPageProps) {
   }
 
   async function handleDeleteCourt(court: Court) {
-    if (court.players.length > 0) return; // guarded in UI too, but double-check here
+    if (court.players.length > 0) return;
 
     const confirmed = window.confirm(`Remove "${court.name}"? This cannot be undone.`);
     if (!confirmed) return;
@@ -194,7 +192,7 @@ function AdminPage({ onBack }: AdminPageProps) {
     <div className="min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 px-4 py-8">
       <div className="max-w-lg mx-auto space-y-6">
         <button
-          onClick={onBack}
+          onClick={() => navigate('/dashboard')}
           className="text-gray-600 hover:text-gray-800 text-sm font-medium flex items-center gap-1"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
