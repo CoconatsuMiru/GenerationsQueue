@@ -4,12 +4,14 @@ import './App.css';
 import type { Player, Court } from './types';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
+import { speak, isSpeechSupported } from './speech';
 import type { Session } from '@supabase/supabase-js';
 
 const GAME_LENGTH_MINUTES = 15;
 const WARMUP_MINUTES = 3;
 const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
+const ANNOUNCE_PAUSE_MS = 1000; // pause after each court announcement finishes, before the next one
 
 interface DashboardProps {
   session: Session;
@@ -49,7 +51,6 @@ function selectNextGroup(
 
   while (group.length < size && i < remaining.length) {
     const unit = remaining[i];
-
     if (unit.length <= size - group.length) {
       group.push(...unit);
       remaining.splice(i, 1);
@@ -61,22 +62,13 @@ function selectNextGroup(
   return { group, remainingUnits: remaining };
 }
 
-function buildQueueGroups(
-  units: Player[][],
-  size: number,
-  maxGroups: number
-): Player[][] {
+function buildQueueGroups(units: Player[][], size: number, maxGroups: number): Player[][] {
   const groups: Player[][] = [];
   let remainingUnits = units;
 
   while (remainingUnits.length > 0 && groups.length < maxGroups) {
-    const { group, remainingUnits: rest } = selectNextGroup(
-      remainingUnits,
-      size
-    );
-
+    const { group, remainingUnits: rest } = selectNextGroup(remainingUnits, size);
     if (group.length === 0) break;
-
     groups.push(group);
     remainingUnits = rest;
   }
@@ -103,6 +95,10 @@ function Dashboard({ session }: DashboardProps) {
 
   const [isSessionActive, setIsSessionActive] = useState(false);
 
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const announcedAssignments = useRef<Set<string>>(new Set());
+  const announcedOvertime = useRef<Set<string>>(new Set());
+
   const isAssigning = useRef(false);
   const autoEndingCourts = useRef<Set<number>>(new Set());
 
@@ -117,12 +113,11 @@ function Dashboard({ session }: DashboardProps) {
   async function loadData() {
     const userId = session.user.id;
 
-    const { data: existingSession, error: sessionReadError } =
-      await supabase
-        .from('session_state')
-        .select('*')
-        .eq('owner_id', userId)
-        .maybeSingle();
+    const { data: existingSession, error: sessionReadError } = await supabase
+      .from('session_state')
+      .select('*')
+      .eq('owner_id', userId)
+      .maybeSingle();
 
     if (sessionReadError) {
       console.error('SESSION READ ERROR:', sessionReadError);
@@ -136,10 +131,7 @@ function Dashboard({ session }: DashboardProps) {
     } else {
       const { data: created, error: createError } = await supabase
         .from('session_state')
-        .insert({
-          owner_id: userId,
-          is_active: false,
-        })
+        .insert({ owner_id: userId, is_active: false })
         .select()
         .single();
 
@@ -158,29 +150,11 @@ function Dashboard({ session }: DashboardProps) {
         .eq('owner_id', userId);
 
       if (!existingCourts || existingCourts.length === 0) {
-        const { error: createCourtsError } = await supabase
-          .from('courts')
-          .insert([
-            {
-              owner_id: userId,
-              name: 'Court 1',
-              player_ids: [],
-              start_time: null,
-            },
-            {
-              owner_id: userId,
-              name: 'Court 2',
-              player_ids: [],
-              start_time: null,
-            },
-          ]);
-
-        if (createCourtsError) {
-          console.error(
-            'Error creating starter courts:',
-            createCourtsError
-          );
-        }
+        const { error: createCourtsError } = await supabase.from('courts').insert([
+          { owner_id: userId, name: 'Court 1', player_ids: [], start_time: null },
+          { owner_id: userId, name: 'Court 2', player_ids: [], start_time: null },
+        ]);
+        if (createCourtsError) console.error('Error creating starter courts:', createCourtsError);
       }
     }
 
@@ -196,13 +170,8 @@ function Dashboard({ session }: DashboardProps) {
       .eq('owner_id', userId)
       .order('id', { ascending: true });
 
-    if (playersError) {
-      console.error('Error loading players:', playersError);
-    }
-
-    if (courtsError) {
-      console.error('Error loading courts:', courtsError);
-    }
+    if (playersError) console.error('Error loading players:', playersError);
+    if (courtsError) console.error('Error loading courts:', courtsError);
 
     const allPlayers: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
@@ -213,20 +182,13 @@ function Dashboard({ session }: DashboardProps) {
     const playingIds = new Set(
       (dbCourts ?? []).flatMap((c) => c.player_ids ?? [])
     );
-
-    const waitingPlayers = allPlayers.filter(
-      (p) => !playingIds.has(p.id)
-    );
+    const waitingPlayers = allPlayers.filter((p) => !playingIds.has(p.id));
 
     const mappedCourts: Court[] = (dbCourts ?? []).map((c) => ({
       id: c.id,
       name: c.name,
-      players: allPlayers.filter((p) =>
-        (c.player_ids ?? []).includes(p.id)
-      ),
-      startTime: c.start_time
-        ? new Date(c.start_time).getTime()
-        : null,
+      players: allPlayers.filter((p) => (c.player_ids ?? []).includes(p.id)),
+      startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
 
     setPlayers(waitingPlayers);
@@ -236,7 +198,6 @@ function Dashboard({ session }: DashboardProps) {
 
   useEffect(() => {
     loadData();
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -247,7 +208,6 @@ function Dashboard({ session }: DashboardProps) {
 
     function scheduleReload() {
       clearTimeout(debounceTimer);
-
       debounceTimer = setTimeout(() => {
         loadData();
       }, 250);
@@ -257,32 +217,17 @@ function Dashboard({ session }: DashboardProps) {
       .channel('dashboard-changes')
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'courts',
-          filter: `owner_id=eq.${userId}`,
-        },
+        { event: '*', schema: 'public', table: 'courts', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'players',
-          filter: `owner_id=eq.${userId}`,
-        },
+        { event: '*', schema: 'public', table: 'players', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'session_state',
-          filter: `owner_id=eq.${userId}`,
-        },
+        { event: '*', schema: 'public', table: 'session_state', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
       .subscribe();
@@ -291,88 +236,115 @@ function Dashboard({ session }: DashboardProps) {
       clearTimeout(debounceTimer);
       supabase.removeChannel(channel);
     };
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Triggers the sequential court-filling routine whenever players, courts,
+  // or session state change. assignOpenCourts() guards against overlapping
+  // runs itself via isAssigning.current.
   useEffect(() => {
     if (!isSessionActive) return;
-
-    const openCourt = courts.find(
-      (court) => court.players.length === 0
-    );
-
-    if (!openCourt) return;
-    if (isAssigning.current) return;
-
-    // Capture the ID before entering the async function.
-    // This fixes the TypeScript "possibly undefined" error.
-    const openCourtId = openCourt.id;
-
-    const units = buildUnits(players);
-    const { group } = selectNextGroup(units, 4);
-
-    if (group.length < 4) return;
-
-    async function assignCourt() {
-      isAssigning.current = true;
-
-      const { error } = await supabase
-        .from('courts')
-        .update({
-          player_ids: group.map((p) => p.id),
-          start_time: new Date().toISOString(),
-        })
-        .eq('id', openCourtId);
-
-      if (error) {
-        console.error('Error assigning court:', error);
-      }
-
-      isAssigning.current = false;
-    }
-
-    assignCourt();
+    assignOpenCourts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, courts, isSessionActive]);
 
+  // Fills empty courts ONE AT A TIME instead of all at once. For each open
+  // court: assigns players in the DB, updates local state immediately so
+  // the loop can keep going without waiting on the realtime round trip,
+  // announces the lineup by voice, and only moves to the next open court
+  // after that announcement has fully finished playing (plus a short
+  // pause). This is what stops multiple "Court X..." announcements from
+  // overlapping or talking over each other when several courts are empty
+  // at once (e.g. right when a session starts).
+  async function assignOpenCourts() {
+    if (isAssigning.current) return;
+    isAssigning.current = true;
+
+    try {
+      let remainingPlayers = players;
+      let remainingCourts = courts;
+
+      while (true) {
+        const openCourt = remainingCourts.find((c) => c.players.length === 0);
+        if (!openCourt) break;
+
+        const units = buildUnits(remainingPlayers);
+        const { group } = selectNextGroup(units, 4);
+        if (group.length < 4) break;
+
+        const startTimeIso = new Date().toISOString();
+
+        const { error } = await supabase
+          .from('courts')
+          .update({
+            player_ids: group.map((p) => p.id),
+            start_time: startTimeIso,
+          })
+          .eq('id', openCourt.id);
+
+        if (error) {
+          console.error('Error assigning court:', error);
+          break;
+        }
+
+        const startTimeMs = new Date(startTimeIso).getTime();
+        announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
+
+        const assignedIds = new Set(group.map((p) => p.id));
+        remainingPlayers = remainingPlayers.filter((p) => !assignedIds.has(p.id));
+        remainingCourts = remainingCourts.map((c) =>
+          c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
+        );
+
+        setPlayers(remainingPlayers);
+        setCourts(remainingCourts);
+
+        if (voiceEnabled && isSpeechSupported()) {
+          const names = group.map((p) => p.name).join(', ');
+          await speak(`${openCourt.name}. ${names}.`);
+          await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
+        }
+      }
+    } finally {
+      isAssigning.current = false;
+    }
+  }
+
   useEffect(() => {
-    const totalMs =
-      (WARMUP_MINUTES +
-        GAME_LENGTH_MINUTES +
-        OVERTIME_MINUTES) *
-      60 *
-      1000;
+    const gameEndMs = (WARMUP_MINUTES + GAME_LENGTH_MINUTES) * 60 * 1000;
+    const totalMs = gameEndMs + OVERTIME_MINUTES * 60 * 1000;
 
     courts.forEach((court) => {
       if (court.startTime === null) return;
-
       const elapsedMs = Date.now() - court.startTime;
+      const key = `${court.id}-${court.startTime}`;
+
+      // Announce overtime once, right when the game clock crosses into it.
+      if (voiceEnabled && elapsedMs >= gameEndMs && elapsedMs < totalMs) {
+        if (!announcedOvertime.current.has(key)) {
+          announcedOvertime.current.add(key);
+          speak(`${court.name}, overtime.`);
+        }
+      }
 
       if (elapsedMs < totalMs) return;
       if (autoEndingCourts.current.has(court.id)) return;
 
       autoEndingCourts.current.add(court.id);
-
       handleEndGame(court.id).finally(() => {
         autoEndingCourts.current.delete(court.id);
       });
     });
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, courts]);
+  }, [tick, courts, voiceEnabled]);
 
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
-
     const userId = session.user.id;
 
     const { data, error } = await supabase
       .from('players')
-      .insert({
-        name: nameInput,
-        queue_position: Date.now(),
-        owner_id: userId,
-      })
+      .insert({ name: nameInput, queue_position: Date.now(), owner_id: userId })
       .select()
       .single();
 
@@ -381,19 +353,12 @@ function Dashboard({ session }: DashboardProps) {
       return;
     }
 
-    const newPlayer: Player = {
-      id: data.id,
-      name: data.name,
-      partnerId: data.partner_id,
-    };
-
+    const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
     setPlayers([...players, newPlayer]);
     setNameInput('');
   }
 
-  function handleNameInputKeyDown(
-    e: React.KeyboardEvent<HTMLInputElement>
-  ) {
+  function handleNameInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Enter') {
       handleAddPlayer();
     }
@@ -410,7 +375,6 @@ function Dashboard({ session }: DashboardProps) {
     if (names.length === 0) return;
 
     const now = Date.now();
-
     const rowsToInsert = names.map((name, index) => ({
       name,
       queue_position: now + index,
@@ -441,27 +405,15 @@ function Dashboard({ session }: DashboardProps) {
   async function handleRemovePlayer(id: number) {
     const player = players.find((p) => p.id === id);
 
-    if (
-      player?.partnerId !== null &&
-      player?.partnerId !== undefined
-    ) {
+    if (player?.partnerId !== null && player?.partnerId !== undefined) {
       const { error: unpairError } = await supabase
         .from('players')
         .update({ partner_id: null })
         .eq('id', player.partnerId);
-
-      if (unpairError) {
-        console.error(
-          'Error clearing partner link:',
-          unpairError
-        );
-      }
+      if (unpairError) console.error('Error clearing partner link:', unpairError);
     }
 
-    const { error } = await supabase
-      .from('players')
-      .delete()
-      .eq('id', id);
+    const { error } = await supabase.from('players').delete().eq('id', id);
 
     if (error) {
       console.error('Error removing player:', error);
@@ -471,69 +423,42 @@ function Dashboard({ session }: DashboardProps) {
     setPlayers(
       players
         .filter((p) => p.id !== id)
-        .map((p) =>
-          p.id === player?.partnerId
-            ? { ...p, partnerId: null }
-            : p
-        )
+        .map((p) => (p.id === player?.partnerId ? { ...p, partnerId: null } : p))
     );
   }
 
   async function handleSkipPlayer(id: number) {
     const player = players.find((p) => p.id === id);
-
     if (!player) return;
 
-    const idsToSkip =
-      player.partnerId !== null
-        ? [id, player.partnerId]
-        : [id];
-
+    const idsToSkip = player.partnerId !== null ? [id, player.partnerId] : [id];
     const now = Date.now();
 
     for (let i = 0; i < idsToSkip.length; i++) {
       const { error } = await supabase
         .from('players')
-        .update({
-          queue_position: now + i,
-        })
+        .update({ queue_position: now + i })
         .eq('id', idsToSkip[i]);
-
-      if (error) {
-        console.error('Error skipping player:', error);
-      }
+      if (error) console.error('Error skipping player:', error);
     }
 
-    const skipped = players.filter((p) =>
-      idsToSkip.includes(p.id)
-    );
-
-    const remaining = players.filter(
-      (p) => !idsToSkip.includes(p.id)
-    );
-
+    const skipped = players.filter((p) => idsToSkip.includes(p.id));
+    const remaining = players.filter((p) => !idsToSkip.includes(p.id));
     setPlayers([...remaining, ...skipped]);
   }
 
   async function handleEndGame(courtId: number) {
     const court = courts.find((c) => c.id === courtId);
-
     if (!court) return;
 
     const { error: courtError } = await supabase
       .from('courts')
-      .update({
-        player_ids: [],
-        start_time: null,
-      })
+      .update({ player_ids: [], start_time: null })
       .eq('id', courtId);
 
-    if (courtError) {
-      console.error('Error ending game:', courtError);
-    }
+    if (courtError) console.error('Error ending game:', courtError);
 
     const now = Date.now();
-
     const requeueRows = court.players.map((player, i) => ({
       id: player.id,
       queue_position: now + i,
@@ -542,29 +467,15 @@ function Dashboard({ session }: DashboardProps) {
     if (requeueRows.length > 0) {
       const { error: requeueError } = await supabase
         .from('players')
-        .upsert(requeueRows, {
-          onConflict: 'id',
-        });
+        .upsert(requeueRows, { onConflict: 'id' });
 
-      if (requeueError) {
-        console.error(
-          'Error requeuing players:',
-          requeueError
-        );
-      }
+      if (requeueError) console.error('Error requeuing players:', requeueError);
     }
 
     setPlayers([...players, ...court.players]);
-
     setCourts(
       courts.map((c) =>
-        c.id === courtId
-          ? {
-              ...c,
-              players: [],
-              startTime: null,
-            }
-          : c
+        c.id === courtId ? { ...c, players: [], startTime: null } : c
       )
     );
   }
@@ -575,7 +486,6 @@ function Dashboard({ session }: DashboardProps) {
     const confirmed = window.confirm(
       'Reset the entire session? This will remove all players and clear all courts.'
     );
-
     if (!confirmed) return;
 
     const { error: deletePlayersError } = await supabase
@@ -585,39 +495,17 @@ function Dashboard({ session }: DashboardProps) {
 
     const { error: resetCourtsError } = await supabase
       .from('courts')
-      .update({
-        player_ids: [],
-        start_time: null,
-      })
+      .update({ player_ids: [], start_time: null })
       .eq('owner_id', userId);
 
     const { error: resetSessionError } = await supabase
       .from('session_state')
-      .update({
-        is_active: false,
-      })
+      .update({ is_active: false })
       .eq('owner_id', userId);
 
-    if (deletePlayersError) {
-      console.error(
-        'Error clearing players:',
-        deletePlayersError
-      );
-    }
-
-    if (resetCourtsError) {
-      console.error(
-        'Error resetting courts:',
-        resetCourtsError
-      );
-    }
-
-    if (resetSessionError) {
-      console.error(
-        'Error resetting session state:',
-        resetSessionError
-      );
-    }
+    if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
+    if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
+    if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
   }
 
   async function handleToggleSession() {
@@ -626,136 +514,70 @@ function Dashboard({ session }: DashboardProps) {
 
     const { error } = await supabase
       .from('session_state')
-      .update({
-        is_active: newValue,
-      })
+      .update({ is_active: newValue })
       .eq('owner_id', userId);
 
     if (error) {
-      console.error(
-        'Error updating session state:',
-        error
-      );
+      console.error('Error updating session state:', error);
       return;
     }
-
-    setIsSessionActive(newValue);
   }
 
-  async function handlePairPlayers(
-    idA: number,
-    idB: number
-  ) {
+  async function handlePairPlayers(idA: number, idB: number) {
     if (idA === idB) return;
 
-    const { error: errA } = await supabase
-      .from('players')
-      .update({ partner_id: idB })
-      .eq('id', idA);
-
-    const { error: errB } = await supabase
-      .from('players')
-      .update({ partner_id: idA })
-      .eq('id', idB);
+    const { error: errA } = await supabase.from('players').update({ partner_id: idB }).eq('id', idA);
+    const { error: errB } = await supabase.from('players').update({ partner_id: idA }).eq('id', idB);
 
     if (errA || errB) {
-      console.error(
-        'Error pairing players:',
-        errA || errB
-      );
+      console.error('Error pairing players:', errA || errB);
       return;
     }
 
     setPlayers(
       players.map((p) => {
-        if (p.id === idA) {
-          return {
-            ...p,
-            partnerId: idB,
-          };
-        }
-
-        if (p.id === idB) {
-          return {
-            ...p,
-            partnerId: idA,
-          };
-        }
-
+        if (p.id === idA) return { ...p, partnerId: idB };
+        if (p.id === idB) return { ...p, partnerId: idA };
         return p;
       })
     );
-
     setPairingSourceId(null);
   }
 
   async function handleUnpairPlayer(id: number) {
     const player = players.find((p) => p.id === id);
-
     if (!player || player.partnerId === null) return;
 
     const partnerId = player.partnerId;
 
-    const { error: errA } = await supabase
-      .from('players')
-      .update({ partner_id: null })
-      .eq('id', id);
-
-    const { error: errB } = await supabase
-      .from('players')
-      .update({ partner_id: null })
-      .eq('id', partnerId);
+    const { error: errA } = await supabase.from('players').update({ partner_id: null }).eq('id', id);
+    const { error: errB } = await supabase.from('players').update({ partner_id: null }).eq('id', partnerId);
 
     if (errA || errB) {
-      console.error(
-        'Error unpairing players:',
-        errA || errB
-      );
+      console.error('Error unpairing players:', errA || errB);
       return;
     }
 
     setPlayers(
-      players.map((p) =>
-        p.id === id || p.id === partnerId
-          ? {
-              ...p,
-              partnerId: null,
-            }
-          : p
-      )
+      players.map((p) => (p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p))
     );
   }
 
   const units = buildUnits(players);
-  const queueStacks = buildQueueGroups(
-    units,
-    4,
-    MAX_QUEUE_STACKS
-  );
-
-  const courtsInPlay = courts.filter(
-    (c) => c.players.length > 0
-  ).length;
+  const queueStacks = buildQueueGroups(units, 4, MAX_QUEUE_STACKS);
+  const courtsInPlay = courts.filter((c) => c.players.length > 0).length;
 
   const filteredUnits = units.filter((unit) =>
-    unit.some((p) =>
-      p.name
-        .toLowerCase()
-        .includes(searchTerm.trim().toLowerCase())
-    )
+    unit.some((p) => p.name.toLowerCase().includes(searchTerm.trim().toLowerCase()))
   );
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
       <div className="fixed inset-0 -z-10 overflow-hidden">
         <div className="absolute inset-0 bg-dot-grid opacity-60" />
-
         <div className="animate-blob absolute -top-24 -left-24 w-[28rem] h-[28rem] bg-green-400 rounded-full blur-3xl opacity-50" />
-
         <div className="animate-blob-delayed absolute top-1/4 -right-24 w-[28rem] h-[28rem] bg-emerald-500 rounded-full blur-3xl opacity-40" />
-
         <div className="animate-blob absolute -bottom-24 left-1/3 w-[28rem] h-[28rem] bg-teal-400 rounded-full blur-3xl opacity-40" />
-
         <div className="animate-blob-delayed absolute bottom-1/4 right-1/4 w-80 h-80 bg-lime-300 rounded-full blur-3xl opacity-30" />
       </div>
 
@@ -764,41 +586,23 @@ function Dashboard({ session }: DashboardProps) {
           <div className="flex items-center justify-between flex-wrap gap-4">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-white/20 backdrop-blur rounded-xl flex items-center justify-center">
-                <svg
-                  className="w-6 h-6 text-white"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
+                <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <circle cx="12" cy="12" r="9" />
-                  <path
-                    strokeLinecap="round"
-                    d="M8 12h8M12 8v8"
-                  />
+                  <path strokeLinecap="round" d="M8 12h8M12 8v8" />
                 </svg>
               </div>
-
               <div>
                 <div className="flex items-center gap-2">
-                  <h1 className="text-2xl font-extrabold text-white tracking-tight">
-                    PickleQueue
-                  </h1>
-
+                  <h1 className="text-2xl font-extrabold text-white tracking-tight">PickleQueue</h1>
                   <span
                     className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                      isSessionActive
-                        ? 'bg-white/25 text-white'
-                        : 'bg-black/20 text-white/80'
+                      isSessionActive ? 'bg-white/25 text-white' : 'bg-black/20 text-white/80'
                     }`}
                   >
                     {isSessionActive ? '● LIVE' : 'PAUSED'}
                   </span>
                 </div>
-
-                <p className="text-green-100 text-xs font-medium">
-                  Digital paddle board & queue
-                </p>
+                <p className="text-green-100 text-xs font-medium">Digital paddle board & queue</p>
               </div>
             </div>
 
@@ -806,41 +610,34 @@ function Dashboard({ session }: DashboardProps) {
               <input
                 type="text"
                 value={nameInput}
-                onChange={(e) =>
-                  setNameInput(e.target.value)
-                }
+                onChange={(e) => setNameInput(e.target.value)}
                 onKeyDown={handleNameInputKeyDown}
                 placeholder="Player name"
                 className="bg-white/95 border-0 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white w-40"
               />
-
               <button
                 onClick={handleAddPlayer}
                 className="bg-white text-green-700 hover:bg-green-50 font-semibold text-sm px-4 py-2 rounded-lg transition-colors shadow-sm"
               >
                 Add Player
               </button>
-
               <button
                 onClick={() => setShowBatchModal(true)}
                 className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 + Multiple
               </button>
-
               <button
                 onClick={() => setShowQueueSidebar(true)}
                 className="relative bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 Manage Queue
-
                 {players.length > 0 && (
                   <span className="absolute -top-2 -right-2 bg-white text-green-700 text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center">
                     {players.length}
                   </span>
                 )}
               </button>
-
               <button
                 onClick={handleToggleSession}
                 className={`font-semibold text-sm px-4 py-2 rounded-lg border transition-colors ${
@@ -849,25 +646,29 @@ function Dashboard({ session }: DashboardProps) {
                     : 'bg-white text-green-700 hover:bg-green-50 border-white'
                 }`}
               >
-                {isSessionActive
-                  ? 'Pause Session'
-                  : 'Start Session'}
+                {isSessionActive ? 'Pause Session' : 'Start Session'}
               </button>
-
               <button
                 onClick={handleResetSession}
                 className="bg-white/15 hover:bg-red-500/80 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 Reset
               </button>
-
+              {isSpeechSupported() && (
+                <button
+                  onClick={() => setVoiceEnabled((v) => !v)}
+                  title={voiceEnabled ? 'Mute announcements' : 'Unmute announcements'}
+                  className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+                >
+                  {voiceEnabled ? '🔊 Voice On' : '🔇 Voice Off'}
+                </button>
+              )}
               <button
                 onClick={() => navigate('/admin')}
                 className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 ⚙ Settings
               </button>
-
               <button
                 onClick={() => supabase.auth.signOut()}
                 className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
@@ -883,52 +684,29 @@ function Dashboard({ session }: DashboardProps) {
         {!isSessionActive && (
           <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm font-medium rounded-lg px-4 py-3 mb-6 flex items-center gap-2">
             <span>⏸</span>
-
             <span>
-              Session is paused — players can be added and
-              managed, but courts won't auto-fill until you
-              click "Start Session."
+              Session is paused — players can be added and managed, but courts won't auto-fill until you click "Start Session."
             </span>
           </div>
         )}
 
         <div className="grid grid-cols-3 gap-4 mb-6">
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">
-              {courtsInPlay}/{courts.length}
-            </p>
-
-            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">
-              Courts in Play
-            </p>
+            <p className="text-3xl font-extrabold text-gray-800">{courtsInPlay}/{courts.length}</p>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">Courts in Play</p>
           </div>
-
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">
-              {players.length}
-            </p>
-
-            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">
-              In Queue
-            </p>
+            <p className="text-3xl font-extrabold text-gray-800">{players.length}</p>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">In Queue</p>
           </div>
-
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">
-              {GAME_LENGTH_MINUTES}m
-            </p>
-
-            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">
-              Game Timer
-            </p>
+            <p className="text-3xl font-extrabold text-gray-800">{GAME_LENGTH_MINUTES}m</p>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">Game Timer</p>
           </div>
         </div>
 
         <div>
-          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
-            Courts
-          </h2>
-
+          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {courts.map((court) => (
               <CourtCard
@@ -948,7 +726,6 @@ function Dashboard({ session }: DashboardProps) {
             <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
               Upcoming Stacks
             </h2>
-
             <div className="flex gap-4 overflow-x-auto pb-2">
               {queueStacks.map((stack, stackIndex) => (
                 <div
@@ -962,50 +739,34 @@ function Dashboard({ session }: DashboardProps) {
                   <div className="flex items-center justify-between mb-3">
                     <span
                       className={`text-xs font-bold uppercase tracking-wide ${
-                        stackIndex === 0
-                          ? 'text-green-100'
-                          : 'text-gray-400'
+                        stackIndex === 0 ? 'text-green-100' : 'text-gray-400'
                       }`}
                     >
                       Stack {stackIndex + 1}
                     </span>
-
                     {stackIndex === 0 && (
                       <span className="text-[10px] font-bold bg-white/25 px-2 py-0.5 rounded-full">
                         NEXT
                       </span>
                     )}
                   </div>
-
                   <ul className="space-y-1.5">
                     {stack.map((player, i) => (
                       <li
                         key={player.id}
                         className={`text-sm font-medium truncate rounded-md px-2 py-1 flex items-center gap-1 ${
-                          stackIndex === 0
-                            ? 'bg-white/15'
-                            : 'bg-gray-50'
+                          stackIndex === 0 ? 'bg-white/15' : 'bg-gray-50'
                         }`}
                       >
-                        <span>
-                          {i + 1}. {player.name}
-                        </span>
-
-                        {player.partnerId !== null && (
-                          <span className="text-xs">🔗</span>
-                        )}
+                        <span>{i + 1}. {player.name}</span>
+                        {player.partnerId !== null && <span className="text-xs">🔗</span>}
                       </li>
                     ))}
-
-                    {Array.from({
-                      length: 4 - stack.length,
-                    }).map((_, i) => (
+                    {Array.from({ length: 4 - stack.length }).map((_, i) => (
                       <li
                         key={`empty-${i}`}
                         className={`text-sm rounded-md px-2 py-1 ${
-                          stackIndex === 0
-                            ? 'text-green-200/60'
-                            : 'text-gray-300'
+                          stackIndex === 0 ? 'text-green-200/60' : 'text-gray-300'
                         }`}
                       >
                         —
@@ -1022,25 +783,16 @@ function Dashboard({ session }: DashboardProps) {
       {showBatchModal && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md animate-modal-in">
-            <h2 className="text-lg font-bold text-gray-800 mb-1">
-              Add Multiple Players
-            </h2>
-
-            <p className="text-sm text-gray-400 mb-4">
-              Enter Players (Separated by ,)
-            </p>
-
+            <h2 className="text-lg font-bold text-gray-800 mb-1">Add Multiple Players</h2>
+            <p className="text-sm text-gray-400 mb-4">Enter Players (Separated by ,)</p>
             <textarea
               value={batchInput}
-              onChange={(e) =>
-                setBatchInput(e.target.value)
-              }
+              onChange={(e) => setBatchInput(e.target.value)}
               placeholder="e.g. Dave, Sarah, Carlos, Elena"
               rows={4}
               className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 resize-none"
               autoFocus
             />
-
             <div className="flex justify-end gap-2 mt-4">
               <button
                 onClick={() => {
@@ -1051,7 +803,6 @@ function Dashboard({ session }: DashboardProps) {
               >
                 Cancel
               </button>
-
               <button
                 onClick={handleAddBatchPlayers}
                 className="bg-green-600 hover:bg-green-700 text-white font-semibold text-sm px-4 py-2 rounded-lg transition-colors shadow-sm"
@@ -1075,10 +826,7 @@ function Dashboard({ session }: DashboardProps) {
 
           <div className="relative w-full max-w-sm bg-white h-full shadow-2xl overflow-y-auto animate-modal-in flex flex-col">
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 sticky top-0 bg-white z-10">
-              <h2 className="text-lg font-bold text-gray-800">
-                Manage Queue
-              </h2>
-
+              <h2 className="text-lg font-bold text-gray-800">Manage Queue</h2>
               <button
                 onClick={() => {
                   setShowQueueSidebar(false);
@@ -1086,44 +834,22 @@ function Dashboard({ session }: DashboardProps) {
                 }}
                 className="text-gray-400 hover:text-gray-600 w-8 h-8 rounded-full hover:bg-gray-100 flex items-center justify-center transition-colors"
               >
-                <svg
-                  className="w-5 h-5"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M6 18L18 6M6 6l12 12"
-                  />
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
             </div>
 
             <div className="px-5 pt-4">
               <div className="relative">
-                <svg
-                  className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
+                <svg className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <circle cx="11" cy="11" r="7" />
-                  <path
-                    strokeLinecap="round"
-                    d="M21 21l-4.3-4.3"
-                  />
+                  <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
                 </svg>
-
                 <input
                   type="text"
                   value={searchTerm}
-                  onChange={(e) =>
-                    setSearchTerm(e.target.value)
-                  }
+                  onChange={(e) => setSearchTerm(e.target.value)}
                   placeholder="Search players..."
                   className="w-full border border-gray-200 rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
                 />
@@ -1134,13 +860,8 @@ function Dashboard({ session }: DashboardProps) {
               <div className="mx-5 mt-3 bg-green-50 border border-green-200 rounded-lg px-3 py-2 flex items-center justify-between">
                 <p className="text-xs font-medium text-green-700">
                   Tap another player to pair with{' '}
-                  {
-                    players.find(
-                      (p) => p.id === pairingSourceId
-                    )?.name
-                  }
+                  {players.find((p) => p.id === pairingSourceId)?.name}
                 </p>
-
                 <button
                   onClick={() => setPairingSourceId(null)}
                   className="text-xs font-semibold text-green-700 hover:text-green-900 ml-2 shrink-0"
@@ -1153,7 +874,6 @@ function Dashboard({ session }: DashboardProps) {
             <div className="p-5">
               <h3 className="text-sm font-bold text-gray-700 mb-3 flex items-center justify-between">
                 <span>Waiting Queue</span>
-
                 {players.length > 0 && (
                   <span className="bg-gray-100 text-gray-500 text-xs font-bold px-2 py-0.5 rounded-full">
                     {players.length}
@@ -1163,9 +883,7 @@ function Dashboard({ session }: DashboardProps) {
 
               {filteredUnits.length === 0 ? (
                 <p className="text-gray-300 text-sm">
-                  {players.length === 0
-                    ? 'No players waiting'
-                    : 'No matches'}
+                  {players.length === 0 ? 'No players waiting' : 'No matches'}
                 </p>
               ) : (
                 <ul className="space-y-2">
@@ -1179,49 +897,31 @@ function Dashboard({ session }: DashboardProps) {
                           <span>🔗</span>
                           <span>Paired</span>
                         </div>
-
                         <div className="flex items-center justify-between mb-1">
-                          <span className="text-sm font-medium text-gray-800 truncate">
-                            {unit[0].name}
-                          </span>
-
-                          <span className="text-sm font-medium text-gray-800 truncate">
-                            {unit[1].name}
-                          </span>
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
                         </div>
-
                         <div className="flex gap-1.5 mt-2">
                           <button
-                            onClick={() =>
-                              handleSkipPlayer(unit[0].id)
-                            }
+                            onClick={() => handleSkipPlayer(unit[0].id)}
                             className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
                           >
                             Skip Pair
                           </button>
-
                           <button
-                            onClick={() =>
-                              handleUnpairPlayer(unit[0].id)
-                            }
+                            onClick={() => handleUnpairPlayer(unit[0].id)}
                             className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
                           >
                             Unpair
                           </button>
-
                           <button
-                            onClick={() =>
-                              handleRemovePlayer(unit[0].id)
-                            }
+                            onClick={() => handleRemovePlayer(unit[0].id)}
                             className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
                           >
                             ✕
                           </button>
-
                           <button
-                            onClick={() =>
-                              handleRemovePlayer(unit[1].id)
-                            }
+                            onClick={() => handleRemovePlayer(unit[1].id)}
                             className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
                           >
                             ✕
@@ -1233,56 +933,38 @@ function Dashboard({ session }: DashboardProps) {
                         key={unit[0].id}
                         className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
                       >
-                        <span className="text-gray-800 text-sm font-medium truncate">
-                          {unit[0].name}
-                        </span>
-
+                        <span className="text-gray-800 text-sm font-medium truncate">{unit[0].name}</span>
                         <div className="flex gap-1.5 shrink-0 ml-2">
                           {pairingSourceId === unit[0].id ? (
                             <button
-                              onClick={() =>
-                                setPairingSourceId(null)
-                              }
+                              onClick={() => setPairingSourceId(null)}
                               className="text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
                             >
                               Cancel
                             </button>
                           ) : pairingSourceId !== null ? (
                             <button
-                              onClick={() =>
-                                handlePairPlayers(
-                                  pairingSourceId,
-                                  unit[0].id
-                                )
-                              }
+                              onClick={() => handlePairPlayers(pairingSourceId, unit[0].id)}
                               className="text-xs font-semibold bg-green-100 hover:bg-green-200 text-green-700 px-2.5 py-1 rounded-md transition-colors"
                             >
                               Pair Here
                             </button>
                           ) : (
                             <button
-                              onClick={() =>
-                                setPairingSourceId(unit[0].id)
-                              }
+                              onClick={() => setPairingSourceId(unit[0].id)}
                               className="text-xs font-semibold bg-purple-50 hover:bg-purple-100 text-purple-600 px-2.5 py-1 rounded-md transition-colors"
                             >
                               🔗 Pair
                             </button>
                           )}
-
                           <button
-                            onClick={() =>
-                              handleSkipPlayer(unit[0].id)
-                            }
+                            onClick={() => handleSkipPlayer(unit[0].id)}
                             className="text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
                           >
                             Skip
                           </button>
-
                           <button
-                            onClick={() =>
-                              handleRemovePlayer(unit[0].id)
-                            }
+                            onClick={() => handleRemovePlayer(unit[0].id)}
                             className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
                           >
                             Remove
