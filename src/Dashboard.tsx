@@ -11,7 +11,7 @@ const GAME_LENGTH_MINUTES = 15;
 const WARMUP_MINUTES = 3;
 const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
-const ANNOUNCE_PAUSE_MS = 1000; // pause after each court announcement finishes, before the next one
+const ANNOUNCE_PAUSE_MS = 1500; // pause after each court announcement finishes, before the next one
 
 interface DashboardProps {
   session: Session;
@@ -74,6 +74,15 @@ function buildQueueGroups(units: Player[][], size: number, maxGroups: number): P
   }
 
   return groups;
+}
+
+function shuffleArray<T>(array: T[]): T[] {
+  const result = [...array];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 }
 
 function Dashboard({ session }: DashboardProps) {
@@ -354,7 +363,7 @@ function Dashboard({ session }: DashboardProps) {
     }
 
     const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
-    setPlayers([...players, newPlayer]);
+    setPlayers((prev) => [...prev, newPlayer]);
     setNameInput('');
   }
 
@@ -397,7 +406,7 @@ function Dashboard({ session }: DashboardProps) {
       partnerId: p.partner_id,
     }));
 
-    setPlayers([...players, ...newPlayers]);
+    setPlayers((prev) => [...prev, ...newPlayers]);
     setBatchInput('');
     setShowBatchModal(false);
   }
@@ -420,8 +429,8 @@ function Dashboard({ session }: DashboardProps) {
       return;
     }
 
-    setPlayers(
-      players
+    setPlayers((prev) =>
+      prev
         .filter((p) => p.id !== id)
         .map((p) => (p.id === player?.partnerId ? { ...p, partnerId: null } : p))
     );
@@ -442,9 +451,51 @@ function Dashboard({ session }: DashboardProps) {
       if (error) console.error('Error skipping player:', error);
     }
 
-    const skipped = players.filter((p) => idsToSkip.includes(p.id));
-    const remaining = players.filter((p) => !idsToSkip.includes(p.id));
-    setPlayers([...remaining, ...skipped]);
+    setPlayers((prev) => {
+      const skipped = prev.filter((p) => idsToSkip.includes(p.id));
+      const remaining = prev.filter((p) => !idsToSkip.includes(p.id));
+      return [...remaining, ...skipped];
+    });
+  }
+
+  async function handleShuffleQueue() {
+    if (players.length === 0) return;
+
+    // Shuffle at the unit level (pairs move together, singles move alone)
+    // rather than shuffling individual players, so a paired duo never
+    // gets split apart by the shuffle.
+    const units = buildUnits(players);
+    const shuffledUnits = shuffleArray(units);
+
+    const now = Date.now();
+    const newOrder: Player[] = [];
+    const updates: { id: number; queue_position: number }[] = [];
+
+    let position = 0;
+    shuffledUnits.forEach((unit) => {
+      unit.forEach((player) => {
+        newOrder.push(player);
+        updates.push({ id: player.id, queue_position: now + position });
+        position++;
+      });
+    });
+
+    // Sequential per-row updates instead of a single upsert — this matches
+    // the pattern handleSkipPlayer already uses successfully, sidestepping
+    // whatever was causing the batched upsert to silently fail.
+    for (const update of updates) {
+      const { error } = await supabase
+        .from('players')
+        .update({ queue_position: update.queue_position })
+        .eq('id', update.id);
+
+      if (error) {
+        console.error('Error shuffling queue:', error);
+        return;
+      }
+    }
+
+    setPlayers(newOrder);
   }
 
   async function handleEndGame(courtId: number) {
@@ -472,9 +523,12 @@ function Dashboard({ session }: DashboardProps) {
       if (requeueError) console.error('Error requeuing players:', requeueError);
     }
 
-    setPlayers([...players, ...court.players]);
-    setCourts(
-      courts.map((c) =>
+    // Functional updates here are the fix: when multiple courts end at
+    // nearly the same time, each call builds on the latest state instead
+    // of a stale snapshot from when it was called, so no updates get lost.
+    setPlayers((prev) => [...prev, ...court.players]);
+    setCourts((prev) =>
+      prev.map((c) =>
         c.id === courtId ? { ...c, players: [], startTime: null } : c
       )
     );
@@ -534,8 +588,8 @@ function Dashboard({ session }: DashboardProps) {
       return;
     }
 
-    setPlayers(
-      players.map((p) => {
+    setPlayers((prev) =>
+      prev.map((p) => {
         if (p.id === idA) return { ...p, partnerId: idB };
         if (p.id === idB) return { ...p, partnerId: idA };
         return p;
@@ -558,8 +612,8 @@ function Dashboard({ session }: DashboardProps) {
       return;
     }
 
-    setPlayers(
-      players.map((p) => (p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p))
+    setPlayers((prev) =>
+      prev.map((p) => (p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p))
     );
   }
 
@@ -626,6 +680,13 @@ function Dashboard({ session }: DashboardProps) {
                 className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 + Multiple
+              </button>
+              <button
+                onClick={handleShuffleQueue}
+                disabled={players.length === 0}
+                className="bg-white/15 hover:bg-white/25 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+              >
+                🔀 Shuffle
               </button>
               <button
                 onClick={() => setShowQueueSidebar(true)}
