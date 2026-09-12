@@ -636,61 +636,89 @@ function Dashboard({ session }: DashboardProps) {
       </div>
 
       <header className="bg-linear-to-r from-green-600 to-emerald-600 shadow-lg">
-        <div className="max-w-6xl mx-auto px-6 py-5">
-          <div className="flex items-center justify-between flex-wrap gap-4">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-white/20 backdrop-blur rounded-xl flex items-center justify-center">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4">
+          <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 shrink-0 bg-white/20 backdrop-blur rounded-xl flex items-center justify-center">
                 <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <circle cx="12" cy="12" r="9" />
                   <path strokeLinecap="round" d="M8 12h8M12 8v8" />
                 </svg>
               </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h1 className="text-2xl font-extrabold text-white tracking-tight">PickleQueue</h1>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight truncate">PickleQueue</h1>
                   <span
-                    className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                    className={`shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full ${
                       isSessionActive ? 'bg-white/25 text-white' : 'bg-black/20 text-white/80'
                     }`}
                   >
                     {isSessionActive ? '● LIVE' : 'PAUSED'}
                   </span>
                 </div>
-                <p className="text-green-100 text-xs font-medium">Digital paddle board & queue</p>
+                <p className="text-green-100 text-xs font-medium hidden sm:block">Digital paddle board & queue</p>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
+              {isSpeechSupported() && (
+                <button
+                  onClick={() => setVoiceEnabled((v) => !v)}
+                  title={voiceEnabled ? 'Mute announcements' : 'Unmute announcements'}
+                  className="w-11 h-11 flex items-center justify-center text-lg bg-white/15 hover:bg-white/25 text-white rounded-lg border border-white/30 transition-colors"
+                >
+                  {voiceEnabled ? '🔊' : '🔇'}
+                </button>
+              )}
+              <button
+                onClick={() => navigate('/admin')}
+                title="Settings"
+                className="w-11 h-11 flex items-center justify-center text-lg bg-white/15 hover:bg-white/25 text-white rounded-lg border border-white/30 transition-colors"
+              >
+                ⚙
+              </button>
+              <button
+                onClick={() => supabase.auth.signOut()}
+                title="Log Out"
+                className="w-11 h-11 flex items-center justify-center text-lg bg-white/15 hover:bg-white/25 text-white rounded-lg border border-white/30 transition-colors"
+              >
+                🚪
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 type="text"
                 value={nameInput}
                 onChange={(e) => setNameInput(e.target.value)}
                 onKeyDown={handleNameInputKeyDown}
                 placeholder="Player name"
-                className="bg-white/95 border-0 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white w-40"
+                className="bg-white/95 border-0 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white w-full sm:w-36"
               />
               <button
                 onClick={handleAddPlayer}
-                className="bg-white text-green-700 hover:bg-green-50 font-semibold text-sm px-4 py-2 rounded-lg transition-colors shadow-sm"
+                className="whitespace-nowrap bg-white text-green-700 hover:bg-green-50 font-semibold text-sm px-4 py-2 rounded-lg transition-colors shadow-sm"
               >
                 Add Player
               </button>
               <button
                 onClick={() => setShowBatchModal(true)}
-                className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+                className="whitespace-nowrap bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 + Multiple
               </button>
               <button
                 onClick={handleShuffleQueue}
                 disabled={players.length === 0}
-                className="bg-white/15 hover:bg-white/25 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+                className="whitespace-nowrap bg-white/15 hover:bg-white/25 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 🔀 Shuffle
               </button>
               <button
                 onClick={() => setShowQueueSidebar(true)}
-                className="relative bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+                className="relative whitespace-nowrap bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 Manage Queue
                 {players.length > 0 && (
@@ -699,9 +727,12 @@ function Dashboard({ session }: DashboardProps) {
                   </span>
                 )}
               </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 onClick={handleToggleSession}
-                className={`font-semibold text-sm px-4 py-2 rounded-lg border transition-colors ${
+                className={`whitespace-nowrap font-semibold text-sm px-4 py-2 rounded-lg border transition-colors ${
                   isSessionActive
                     ? 'bg-white/15 hover:bg-yellow-500/80 text-white border-white/30'
                     : 'bg-white text-green-700 hover:bg-green-50 border-white'
@@ -711,37 +742,16 @@ function Dashboard({ session }: DashboardProps) {
               </button>
               <button
                 onClick={handleResetSession}
-                className="bg-white/15 hover:bg-red-500/80 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
+                className="whitespace-nowrap bg-white/15 hover:bg-red-500/80 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
               >
                 Reset
-              </button>
-              {isSpeechSupported() && (
-                <button
-                  onClick={() => setVoiceEnabled((v) => !v)}
-                  title={voiceEnabled ? 'Mute announcements' : 'Unmute announcements'}
-                  className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
-                >
-                  {voiceEnabled ? '🔊 Voice On' : '🔇 Voice Off'}
-                </button>
-              )}
-              <button
-                onClick={() => navigate('/admin')}
-                className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
-              >
-                ⚙ Settings
-              </button>
-              <button
-                onClick={() => supabase.auth.signOut()}
-                className="bg-white/15 hover:bg-white/25 text-white font-semibold text-sm px-4 py-2 rounded-lg border border-white/30 transition-colors"
-              >
-                Log Out
               </button>
             </div>
           </div>
         </div>
       </header>
 
-      <div className="max-w-6xl mx-auto px-6 py-6">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
         {!isSessionActive && (
           <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm font-medium rounded-lg px-4 py-3 mb-6 flex items-center gap-2">
             <span>⏸</span>
@@ -751,17 +761,17 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         )}
 
-        <div className="grid grid-cols-3 gap-4 mb-6">
-          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">{courtsInPlay}/{courts.length}</p>
+        <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-6">
+          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-3 sm:p-4 text-center">
+            <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">{courtsInPlay}/{courts.length}</p>
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">Courts in Play</p>
           </div>
-          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">{players.length}</p>
+          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-3 sm:p-4 text-center">
+            <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">{players.length}</p>
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">In Queue</p>
           </div>
-          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4 text-center">
-            <p className="text-3xl font-extrabold text-gray-800">{GAME_LENGTH_MINUTES}m</p>
+          <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-3 sm:p-4 text-center">
+            <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">{GAME_LENGTH_MINUTES}m</p>
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">Game Timer</p>
           </div>
         </div>
