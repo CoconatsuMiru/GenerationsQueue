@@ -4,7 +4,7 @@ import './App.css';
 import type { Player, Court } from './types';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
-import { speak, isSpeechSupported } from './speech';
+import { speak, isSpeechSupported, primeSpeechOnFirstInteraction } from './speech';
 import type { Session } from '@supabase/supabase-js';
 
 const GAME_LENGTH_MINUTES = 15;
@@ -21,12 +21,25 @@ function buildUnits(players: Player[]): Player[][] {
   const consumed = new Set<number>();
   const units: Player[][] = [];
 
-  for (const player of players) {
+  for (let i = 0; i < players.length; i++) {
+    const player = players[i];
     if (consumed.has(player.id)) continue;
 
     if (player.partnerId !== null) {
-      const partner = players.find((p) => p.id === player.partnerId);
+      const partnerIndex = players.findIndex((p) => p.id === player.partnerId);
+      const partner = partnerIndex !== -1 ? players[partnerIndex] : undefined;
+
       if (partner && !consumed.has(partner.id)) {
+        if (partnerIndex > i) {
+          // The partner is still further back in the queue — hold off on
+          // forming this pair until we reach the partner's own position,
+          // so the pair's spot reflects the LATER (slower) partner's
+          // place in line, not the earlier one's. This stops pairing
+          // from letting a duo jump ahead of unpaired players who are
+          // actually queued between the two partners.
+          continue;
+        }
+
         units.push([player, partner]);
         consumed.add(player.id);
         consumed.add(partner.id);
@@ -111,6 +124,10 @@ function Dashboard({ session }: DashboardProps) {
   const isAssigning = useRef(false);
   const autoEndingCourts = useRef<Set<number>>(new Set());
 
+  const playersRef = useRef<Player[]>(players);
+  const courtsRef = useRef<Court[]>(courts);
+  const pendingRerun = useRef(false);
+
   useEffect(() => {
     const intervalId = setInterval(() => {
       setTick((t) => t + 1);
@@ -118,6 +135,18 @@ function Dashboard({ session }: DashboardProps) {
 
     return () => clearInterval(intervalId);
   }, []);
+
+  useEffect(() => {
+    primeSpeechOnFirstInteraction();
+  }, []);
+
+  useEffect(() => {
+    playersRef.current = players;
+  }, [players]);
+
+  useEffect(() => {
+    courtsRef.current = courts;
+  }, [courts]);
 
   async function loadData() {
     const userId = session.user.id;
@@ -248,14 +277,23 @@ function Dashboard({ session }: DashboardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Triggers the sequential court-filling routine whenever players, courts,
-  // or session state change. assignOpenCourts() guards against overlapping
-  // runs itself via isAssigning.current.
   useEffect(() => {
     if (!isSessionActive) return;
-    assignOpenCourts();
+    triggerAssignOpenCourts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, courts, isSessionActive]);
+
+  // Guarded entry point. If a run is already in progress (e.g. still
+  // announcing a different court), this doesn't get dropped — it just
+  // flags that another check is needed, and the in-progress run picks it
+  // up as soon as it finishes.
+  function triggerAssignOpenCourts() {
+    if (isAssigning.current) {
+      pendingRerun.current = true;
+      return;
+    }
+    runAssignmentLoop();
+  }
 
   // Fills empty courts ONE AT A TIME instead of all at once. For each open
   // court: assigns players in the DB, updates local state immediately so
@@ -265,13 +303,17 @@ function Dashboard({ session }: DashboardProps) {
   // pause). This is what stops multiple "Court X..." announcements from
   // overlapping or talking over each other when several courts are empty
   // at once (e.g. right when a session starts).
-  async function assignOpenCourts() {
-    if (isAssigning.current) return;
+  async function runAssignmentLoop() {
     isAssigning.current = true;
 
     try {
-      let remainingPlayers = players;
-      let remainingCourts = courts;
+      // Read from refs, not the players/courts captured in this function's
+      // closure — refs always hold the latest state, so if another court
+      // was freed up (e.g. handleEndGame ran) while a previous run was
+      // still busy, a fresh run picks it up correctly instead of working
+      // off an outdated snapshot.
+      let remainingPlayers = playersRef.current;
+      let remainingCourts = courtsRef.current;
 
       while (true) {
         const openCourt = remainingCourts.find((c) => c.players.length === 0);
@@ -305,6 +347,8 @@ function Dashboard({ session }: DashboardProps) {
           c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
         );
 
+        playersRef.current = remainingPlayers;
+        courtsRef.current = remainingCourts;
         setPlayers(remainingPlayers);
         setCourts(remainingCourts);
 
@@ -316,6 +360,13 @@ function Dashboard({ session }: DashboardProps) {
       }
     } finally {
       isAssigning.current = false;
+
+      // If a check got dropped while this run was busy, run it now — this
+      // is what catches "ended court 3 while court 2 was still filling."
+      if (pendingRerun.current) {
+        pendingRerun.current = false;
+        runAssignmentLoop();
+      }
     }
   }
 
@@ -958,48 +1009,52 @@ function Dashboard({ session }: DashboardProps) {
                 </p>
               ) : (
                 <ul className="space-y-2">
-                  {filteredUnits.map((unit) =>
-                    unit.length === 2 ? (
-                      <li
-                        key={`pair-${unit[0].id}-${unit[1].id}`}
-                        className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2"
-                      >
-                        <div className="flex items-center gap-1 text-xs font-semibold text-purple-600 mb-1.5">
-                          <span>🔗</span>
-                          <span>Paired</span>
-                        </div>
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
-                          <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
-                        </div>
-                        <div className="flex gap-1.5 mt-2">
-                          <button
-                            onClick={() => handleSkipPlayer(unit[0].id)}
-                            className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
-                          >
-                            Skip Pair
-                          </button>
-                          <button
-                            onClick={() => handleUnpairPlayer(unit[0].id)}
-                            className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
-                          >
-                            Unpair
-                          </button>
-                          <button
-                            onClick={() => handleRemovePlayer(unit[0].id)}
-                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
-                          >
-                            ✕
-                          </button>
-                          <button
-                            onClick={() => handleRemovePlayer(unit[1].id)}
-                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      </li>
-                    ) : (
+                  {filteredUnits.map((unit) => {
+                    if (unit.length === 2) {
+                      return (
+                        <li
+                          key={`pair-${unit[0].id}-${unit[1].id}`}
+                          className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2"
+                        >
+                          <div className="flex items-center gap-1 text-xs font-semibold text-purple-600 mb-1.5">
+                            <span>🔗</span>
+                            <span>Paired</span>
+                          </div>
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
+                            <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
+                          </div>
+                          <div className="flex gap-1.5 mt-2">
+                            <button
+                              onClick={() => handleSkipPlayer(unit[0].id)}
+                              className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Skip Pair
+                            </button>
+                            <button
+                              onClick={() => handleUnpairPlayer(unit[0].id)}
+                              className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Unpair
+                            </button>
+                            <button
+                              onClick={() => handleRemovePlayer(unit[0].id)}
+                              className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              ✕
+                            </button>
+                            <button
+                              onClick={() => handleRemovePlayer(unit[1].id)}
+                              className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    }
+
+                    return (
                       <li
                         key={unit[0].id}
                         className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
@@ -1042,16 +1097,19 @@ function Dashboard({ session }: DashboardProps) {
                           </button>
                         </div>
                       </li>
-                    )
-                  )}
+                    );
+                  })}
                 </ul>
               )}
             </div>
           </div>
-        </div>
-      )}
+          </div>
+        )}
+      
     </div>
   );
 }
+
+
 
 export default Dashboard;

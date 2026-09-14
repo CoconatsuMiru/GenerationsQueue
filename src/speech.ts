@@ -30,6 +30,35 @@ export function speak(text: string): Promise<void> {
   });
 }
 
+let primed = false;
+
+// iOS Safari only allows the speech engine to start if the very first
+// speak() call on the page happens inside a genuine user tap. Our
+// announcements fire automatically from app logic (a court filling up,
+// overtime hitting), not from a tap, so without this the very first
+// announcement could be silently dropped on iPad/iPhone. Calling this once
+// on page load arms a one-time listener that "unlocks" the speech engine
+// off whatever the user taps first (adding a player, tapping a button,
+// anything), before any real announcement needs to play.
+export function primeSpeechOnFirstInteraction() {
+  if (primed || typeof window === 'undefined' || !window.speechSynthesis) return;
+
+  function unlock() {
+    if (primed) return;
+    primed = true;
+
+    const utterance = new SpeechSynthesisUtterance(' ');
+    utterance.volume = 0;
+    window.speechSynthesis.speak(utterance);
+
+    document.removeEventListener('touchstart', unlock);
+    document.removeEventListener('click', unlock);
+  }
+
+  document.addEventListener('touchstart', unlock, { once: true });
+  document.addEventListener('click', unlock, { once: true });
+}
+
 export function isSpeechSupported(): boolean {
   return typeof window !== 'undefined' && 'speechSynthesis' in window;
 }
