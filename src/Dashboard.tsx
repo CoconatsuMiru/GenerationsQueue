@@ -98,6 +98,21 @@ function shuffleArray<T>(array: T[]): T[] {
   return result;
 }
 
+let lastQueuePosition = 0;
+
+// Date.now() alone has millisecond resolution, so two positions requested
+// close together (e.g. two courts finishing within the same millisecond)
+// could collide and tie. A tie means the database is free to return those
+// rows in a different order on every reload, which is exactly what looks
+// like the queue "randomly shuffling." This guarantees every value handed
+// out is strictly greater than the last one, eliminating that tie at the
+// source.
+function nextQueuePosition(): number {
+  const now = Date.now();
+  lastQueuePosition = now > lastQueuePosition ? now : lastQueuePosition + 1;
+  return lastQueuePosition;
+}
+
 function Dashboard({ session }: DashboardProps) {
   const navigate = useNavigate();
 
@@ -200,7 +215,8 @@ function Dashboard({ session }: DashboardProps) {
       .from('players')
       .select('*')
       .eq('owner_id', userId)
-      .order('queue_position', { ascending: true });
+      .order('queue_position', { ascending: true })
+      .order('id', { ascending: true });
 
     const { data: dbCourts, error: courtsError } = await supabase
       .from('courts')
@@ -404,7 +420,7 @@ function Dashboard({ session }: DashboardProps) {
 
     const { data, error } = await supabase
       .from('players')
-      .insert({ name: nameInput, queue_position: Date.now(), owner_id: userId })
+      .insert({ name: nameInput, queue_position: nextQueuePosition(), owner_id: userId })
       .select()
       .single();
 
@@ -434,10 +450,9 @@ function Dashboard({ session }: DashboardProps) {
 
     if (names.length === 0) return;
 
-    const now = Date.now();
-    const rowsToInsert = names.map((name, index) => ({
+    const rowsToInsert = names.map((name) => ({
       name,
-      queue_position: now + index,
+      queue_position: nextQueuePosition(),
       owner_id: userId,
     }));
 
@@ -492,13 +507,12 @@ function Dashboard({ session }: DashboardProps) {
     if (!player) return;
 
     const idsToSkip = player.partnerId !== null ? [id, player.partnerId] : [id];
-    const now = Date.now();
 
-    for (let i = 0; i < idsToSkip.length; i++) {
+    for (const skipId of idsToSkip) {
       const { error } = await supabase
         .from('players')
-        .update({ queue_position: now + i })
-        .eq('id', idsToSkip[i]);
+        .update({ queue_position: nextQueuePosition() })
+        .eq('id', skipId);
       if (error) console.error('Error skipping player:', error);
     }
 
@@ -518,16 +532,13 @@ function Dashboard({ session }: DashboardProps) {
     const units = buildUnits(players);
     const shuffledUnits = shuffleArray(units);
 
-    const now = Date.now();
     const newOrder: Player[] = [];
     const updates: { id: number; queue_position: number }[] = [];
 
-    let position = 0;
     shuffledUnits.forEach((unit) => {
       unit.forEach((player) => {
         newOrder.push(player);
-        updates.push({ id: player.id, queue_position: now + position });
-        position++;
+        updates.push({ id: player.id, queue_position: nextQueuePosition() });
       });
     });
 
@@ -560,24 +571,48 @@ function Dashboard({ session }: DashboardProps) {
 
     if (courtError) console.error('Error ending game:', courtError);
 
-    const now = Date.now();
-    const requeueRows = court.players.map((player, i) => ({
-      id: player.id,
-      queue_position: now + i,
-    }));
+    // Figure out whether the current tail of the queue is a short stack
+    // (fewer than 4 players) BEFORE these returning players rejoin. If it
+    // is, backfill that gap first with a random subset of the returning
+    // group, so the short stack actually completes instead of sitting
+    // there forever while every future arrival just gets appended after it.
+    const waitingUnits = buildUnits(players);
+    const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
+    const lastStack = waitingStacks[waitingStacks.length - 1];
+    const vacancies = lastStack ? 4 - lastStack.length : 0;
 
-    if (requeueRows.length > 0) {
-      const { error: requeueError } = await supabase
-        .from('players')
-        .upsert(requeueRows, { onConflict: 'id' });
+    let backfill: Player[] = [];
+    let leftover: Player[] = court.players;
 
-      if (requeueError) console.error('Error requeuing players:', requeueError);
+    if (vacancies > 0 && court.players.length > 0) {
+      const shuffled = shuffleArray(court.players);
+      const count = Math.min(vacancies, shuffled.length);
+      backfill = shuffled.slice(0, count);
+      leftover = shuffled.slice(count);
     }
 
-    // Functional updates here are the fix: when multiple courts end at
-    // nearly the same time, each call builds on the latest state instead
-    // of a stale snapshot from when it was called, so no updates get lost.
-    setPlayers((prev) => [...prev, ...court.players]);
+    // Sequential per-row updates instead of a batched upsert — this is the
+    // fix: a batched .upsert() here was silently failing to persist the
+    // new queue_position values, so the very next realtime reload would
+    // snap the queue back to its old order, undoing the backfill/shuffle
+    // that had just happened on screen. Sequential updates are what
+    // handleSkipPlayer and handleShuffleQueue already use successfully.
+    //
+    // Order matters: backfill players are written FIRST so they get the
+    // lower/earlier queue_position values, landing them right after the
+    // existing short stack. Leftover players are written after, forming a
+    // fresh stack behind everyone else.
+    const orderedRequeue = [...backfill, ...leftover];
+    for (const player of orderedRequeue) {
+      const { error: requeueError } = await supabase
+        .from('players')
+        .update({ queue_position: nextQueuePosition() })
+        .eq('id', player.id);
+
+      if (requeueError) console.error('Error requeuing player:', requeueError);
+    }
+
+    setPlayers((prev) => [...prev, ...backfill, ...leftover]);
     setCourts((prev) =>
       prev.map((c) =>
         c.id === courtId ? { ...c, players: [], startTime: null } : c
@@ -1009,52 +1044,48 @@ function Dashboard({ session }: DashboardProps) {
                 </p>
               ) : (
                 <ul className="space-y-2">
-                  {filteredUnits.map((unit) => {
-                    if (unit.length === 2) {
-                      return (
-                        <li
-                          key={`pair-${unit[0].id}-${unit[1].id}`}
-                          className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2"
-                        >
-                          <div className="flex items-center gap-1 text-xs font-semibold text-purple-600 mb-1.5">
-                            <span>🔗</span>
-                            <span>Paired</span>
-                          </div>
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
-                            <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
-                          </div>
-                          <div className="flex gap-1.5 mt-2">
-                            <button
-                              onClick={() => handleSkipPlayer(unit[0].id)}
-                              className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              Skip Pair
-                            </button>
-                            <button
-                              onClick={() => handleUnpairPlayer(unit[0].id)}
-                              className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              Unpair
-                            </button>
-                            <button
-                              onClick={() => handleRemovePlayer(unit[0].id)}
-                              className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              ✕
-                            </button>
-                            <button
-                              onClick={() => handleRemovePlayer(unit[1].id)}
-                              className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
-                            >
-                              ✕
-                            </button>
-                          </div>
-                        </li>
-                      );
-                    }
-
-                    return (
+                  {filteredUnits.map((unit) =>
+                    unit.length === 2 ? (
+                      <li
+                        key={`pair-${unit[0].id}-${unit[1].id}`}
+                        className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2"
+                      >
+                        <div className="flex items-center gap-1 text-xs font-semibold text-purple-600 mb-1.5">
+                          <span>🔗</span>
+                          <span>Paired</span>
+                        </div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
+                          <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
+                        </div>
+                        <div className="flex gap-1.5 mt-2">
+                          <button
+                            onClick={() => handleSkipPlayer(unit[0].id)}
+                            className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Skip Pair
+                          </button>
+                          <button
+                            onClick={() => handleUnpairPlayer(unit[0].id)}
+                            className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 text-purple-700 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            Unpair
+                          </button>
+                          <button
+                            onClick={() => handleRemovePlayer(unit[0].id)}
+                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            ✕
+                          </button>
+                          <button
+                            onClick={() => handleRemovePlayer(unit[1].id)}
+                            className="text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-600 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </li>
+                    ) : (
                       <li
                         key={unit[0].id}
                         className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
@@ -1097,19 +1128,16 @@ function Dashboard({ session }: DashboardProps) {
                           </button>
                         </div>
                       </li>
-                    );
-                  })}
+                    )
+                  )}
                 </ul>
               )}
             </div>
           </div>
-          </div>
-        )}
-      
+        </div>
+      )}
     </div>
   );
 }
-
-
 
 export default Dashboard;
