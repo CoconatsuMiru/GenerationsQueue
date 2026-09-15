@@ -762,7 +762,7 @@ function Dashboard({ session }: DashboardProps) {
               </div>
               <div className="min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight truncate">PickleQueue</h1>
+                  <h1 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight truncate">RallyQ</h1>
                   <span
                     className={`shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full ${
                       isSessionActive ? 'bg-white/25 text-white' : 'bg-black/20 text-white/80'

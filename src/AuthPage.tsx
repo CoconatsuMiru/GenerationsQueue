@@ -37,7 +37,7 @@ function AuthPage() {
               <path strokeLinecap="round" d="M8 12h8M12 8v8" />
             </svg>
           </div>
-          <h1 className="text-2xl font-extrabold text-gray-800">PickleQueue</h1>
+          <h1 className="text-2xl font-extrabold text-gray-800">RallyQ</h1>
           <p className="text-gray-400 text-sm mt-1">
             {mode === 'signin' ? 'Sign in to your dashboard' : 'Create your organizer account'}
           </p>
