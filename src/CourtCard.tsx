@@ -5,13 +5,14 @@ interface CourtCardProps {
   gameLengthMinutes: number;
   warmupMinutes: number;
   overtimeMinutes: number;
+  timeBased: boolean;
   onEndGame: (courtId: number) => void;
 }
 
 type Phase = 'open' | 'warmup' | 'playing' | 'overtime';
 
-function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, onEndGame }: CourtCardProps) {
-  const phase = getPhase(court, warmupMinutes, gameLengthMinutes);
+function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, timeBased, onEndGame }: CourtCardProps) {
+  const phase = getPhase(court, warmupMinutes, gameLengthMinutes, timeBased);
 
   const cardBg =
     phase === 'open'
@@ -91,11 +92,13 @@ function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, o
             ))}
           </ul>
 
-          <div className={`rounded-lg px-3 py-2 mb-3 text-center ${timeBoxStyle}`}>
-            <p className={`text-sm font-semibold tabular-nums ${timeTextStyle}`}>
-              {getTimeDisplay(court.startTime, gameLengthMinutes, warmupMinutes, overtimeMinutes)}
-            </p>
-          </div>
+          {timeBased && (
+            <div className={`rounded-lg px-3 py-2 mb-3 text-center ${timeBoxStyle}`}>
+              <p className={`text-sm font-semibold tabular-nums ${timeTextStyle}`}>
+                {getTimeDisplay(court.startTime, gameLengthMinutes, warmupMinutes, overtimeMinutes)}
+              </p>
+            </div>
+          )}
 
           <button
             onClick={() => onEndGame(court.id)}
@@ -109,8 +112,9 @@ function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, o
   );
 }
 
-function getPhase(court: Court, warmupMinutes: number, gameLengthMinutes: number): Phase {
+function getPhase(court: Court, warmupMinutes: number, gameLengthMinutes: number, timeBased: boolean): Phase {
   if (court.players.length === 0 || court.startTime === null) return 'open';
+  if (!timeBased) return 'playing';
 
   const elapsedSec = Math.floor((Date.now() - court.startTime) / 1000);
   const warmupSec = warmupMinutes * 60;

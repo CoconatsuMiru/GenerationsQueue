@@ -132,6 +132,8 @@ function Dashboard({ session }: DashboardProps) {
 
   const [isSessionActive, setIsSessionActive] = useState(false);
 
+  const [timeBased, setTimeBased] = useState(true);
+
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const announcedAssignments = useRef<Set<string>>(new Set());
   const announcedOvertime = useRef<Set<string>>(new Set());
@@ -195,6 +197,16 @@ function Dashboard({ session }: DashboardProps) {
       sessionActive = created?.is_active ?? false;
       isNewAccount = true;
     }
+
+    const { data: venueSettings, error: venueSettingsError } = await supabase
+      .from('venue_settings')
+      .select('time_based')
+      .eq('owner_id', userId)
+      .maybeSingle();
+
+    if (venueSettingsError) console.error('Error loading venue settings:', venueSettingsError);
+
+    setTimeBased(venueSettings?.time_based ?? true);
 
     if (isNewAccount) {
       const { data: existingCourts } = await supabase
@@ -387,6 +399,8 @@ function Dashboard({ session }: DashboardProps) {
   }
 
   useEffect(() => {
+    if (!timeBased) return;
+
     const gameEndMs = (WARMUP_MINUTES + GAME_LENGTH_MINUTES) * 60 * 1000;
     const totalMs = gameEndMs + OVERTIME_MINUTES * 60 * 1000;
 
@@ -412,7 +426,7 @@ function Dashboard({ session }: DashboardProps) {
       });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, courts, voiceEnabled]);
+  }, [tick, courts, voiceEnabled, timeBased]);
 
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
@@ -857,8 +871,12 @@ function Dashboard({ session }: DashboardProps) {
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">In Queue</p>
           </div>
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-3 sm:p-4 text-center">
-            <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">{GAME_LENGTH_MINUTES}m</p>
-            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">Game Timer</p>
+            <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">
+              {timeBased ? `${GAME_LENGTH_MINUTES}m` : 'Manual'}
+            </p>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">
+              {timeBased ? 'Game Timer' : 'Game Mode'}
+            </p>
           </div>
         </div>
 
@@ -872,6 +890,7 @@ function Dashboard({ session }: DashboardProps) {
                 gameLengthMinutes={GAME_LENGTH_MINUTES}
                 warmupMinutes={WARMUP_MINUTES}
                 overtimeMinutes={OVERTIME_MINUTES}
+                timeBased={timeBased}
                 onEndGame={handleEndGame}
               />
             ))}

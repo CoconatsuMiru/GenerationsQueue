@@ -10,6 +10,7 @@ function AdminPage() {
     warmupMinutes: 3,
     gameMinutes: 15,
     overtimeMinutes: 2,
+    timeBased: true,
   });
   const [courts, setCourts] = useState<Court[]>([]);
   const [newCourtName, setNewCourtName] = useState('');
@@ -44,6 +45,7 @@ function AdminPage() {
         warmupMinutes: data.warmup_minutes,
         gameMinutes: data.game_minutes,
         overtimeMinutes: data.overtime_minutes,
+        timeBased: data.time_based ?? true,
       });
     } else {
       const { error: createError } = await supabase.from('venue_settings').insert({
@@ -51,6 +53,7 @@ function AdminPage() {
         warmup_minutes: 3,
         game_minutes: 15,
         overtime_minutes: 2,
+        time_based: true,
       });
       if (createError) console.error('Error creating venue settings:', createError);
     }
@@ -77,10 +80,11 @@ function AdminPage() {
     const mapped: Court[] = (data ?? []).map((c) => ({
       id: c.id,
       name: c.name,
-      players: [],
+      players: [], // AdminPage only needs occupancy, not player details — see occupiedCourtIds below
       startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
 
+    // Track occupancy directly from player_ids length, since we didn't join players here.
     const occupied = new Set(
       (data ?? []).filter((c) => (c.player_ids ?? []).length > 0).map((c) => c.id)
     );
@@ -102,6 +106,7 @@ function AdminPage() {
         warmup_minutes: settings.warmupMinutes,
         game_minutes: settings.gameMinutes,
         overtime_minutes: settings.overtimeMinutes,
+        time_based: settings.timeBased,
       })
       .eq('owner_id', userId);
 
@@ -162,7 +167,7 @@ function AdminPage() {
   }
 
   async function handleDeleteCourt(court: Court) {
-    if (court.players.length > 0) return;
+    if (court.players.length > 0) return; // guarded in UI too, but double-check here
 
     const confirmed = window.confirm(`Remove "${court.name}"? This cannot be undone.`);
     if (!confirmed) return;
@@ -201,9 +206,46 @@ function AdminPage() {
           Back to Dashboard
         </button>
 
-        {/* Timer settings */}
+        {/* Game mode */}
         <div className="bg-white rounded-2xl shadow-xl p-6">
-          <h1 className="text-xl font-extrabold text-gray-800 mb-1">Timer Settings</h1>
+          <h1 className="text-xl font-extrabold text-gray-800 mb-1">Game Mode</h1>
+          <p className="text-sm text-gray-400 mb-4">
+            Choose how a court's game ends.
+          </p>
+
+          <div className="flex gap-2 mb-3">
+            <button
+              onClick={() => setSettings({ ...settings, timeBased: true })}
+              className={`flex-1 text-sm font-semibold px-4 py-2.5 rounded-lg border transition-colors ${
+                settings.timeBased
+                  ? 'bg-green-600 text-white border-green-600'
+                  : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+              }`}
+            >
+              Time Based
+            </button>
+            <button
+              onClick={() => setSettings({ ...settings, timeBased: false })}
+              className={`flex-1 text-sm font-semibold px-4 py-2.5 rounded-lg border transition-colors ${
+                !settings.timeBased
+                  ? 'bg-green-600 text-white border-green-600'
+                  : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+              }`}
+            >
+              Game Based
+            </button>
+          </div>
+
+          <p className="text-xs text-gray-400">
+            {settings.timeBased
+              ? 'Courts automatically clear once the timer below runs out.'
+              : 'Courts stay live with no timer — an organizer taps "End Game" on the court to send it back to the queue. Timer settings below are ignored in this mode.'}
+          </p>
+        </div>
+
+        {/* Timer settings */}
+        <div className={`bg-white rounded-2xl shadow-xl p-6 transition-opacity ${settings.timeBased ? '' : 'opacity-50'}`}>
+          <h2 className="text-xl font-extrabold text-gray-800 mb-1">Timer Settings</h2>
           <p className="text-sm text-gray-400 mb-6">
             Adjust timer lengths for every court. Changes apply the next time a court starts a new game.
           </p>
@@ -218,10 +260,11 @@ function AdminPage() {
                 min={0}
                 step={0.5}
                 value={settings.warmupMinutes}
+                disabled={!settings.timeBased}
                 onChange={(e) =>
                   setSettings({ ...settings, warmupMinutes: parseFloat(e.target.value) || 0 })
                 }
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:cursor-not-allowed"
               />
             </div>
 
@@ -234,10 +277,11 @@ function AdminPage() {
                 min={1}
                 step={0.5}
                 value={settings.gameMinutes}
+                disabled={!settings.timeBased}
                 onChange={(e) =>
                   setSettings({ ...settings, gameMinutes: parseFloat(e.target.value) || 0 })
                 }
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:cursor-not-allowed"
               />
             </div>
 
@@ -250,10 +294,11 @@ function AdminPage() {
                 min={0}
                 step={0.5}
                 value={settings.overtimeMinutes}
+                disabled={!settings.timeBased}
                 onChange={(e) =>
                   setSettings({ ...settings, overtimeMinutes: parseFloat(e.target.value) || 0 })
                 }
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:cursor-not-allowed"
               />
             </div>
           </div>
