@@ -1,6 +1,6 @@
-# 🥒 PickleQueue
+# 🥒 RallyQ
 
-**PickleQueue** is a digital paddle board & queue management system for pickleball venues — a modern replacement for the physical clipboard/paddle-rack system many community courts still use.
+**RallyQ** is a digital paddle board & queue management system for pickleball venues — a modern replacement for the physical clipboard/paddle-rack system many community courts still use.
 
 Organizers can check players in, automatically rotate them onto open courts in FIFO order, keep paired players together, run timed or manual game modes, and announce court assignments out loud — all from a live, multi-device dashboard.
 
