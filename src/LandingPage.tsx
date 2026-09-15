@@ -16,7 +16,7 @@ function LandingPage({ session }: LandingPageProps) {
               <path strokeLinecap="round" d="M8 12h8M12 8v8" />
             </svg>
           </div>
-          <span className="text-xl font-extrabold text-gray-800">PickleQueue</span>
+          <span className="text-xl font-extrabold text-gray-800">RallyQ</span>
         </div>
         <Link
           to={session ? '/dashboard' : '/login'}
@@ -31,7 +31,7 @@ function LandingPage({ session }: LandingPageProps) {
           Run open play without the whiteboard.
         </h1>
         <p className="text-lg text-gray-500 max-w-xl mx-auto mb-8">
-          PickleQueue auto-fills your courts, tracks game timers, and manages the waiting queue
+          RallyQ auto-fills your courts, tracks game timers, and manages the waiting queue
           — so you can stop babysitting a clipboard and start playing.
         </p>
         <Link
