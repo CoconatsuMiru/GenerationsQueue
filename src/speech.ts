@@ -9,6 +9,56 @@ function ensureVoicesLoaded() {
   voicesLoaded = true;
 }
 
+const VOICE_STORAGE_KEY = 'pickleQueueVoiceURI';
+
+// The chosen voice is a per-device/browser preference (available voices
+// differ by device), so it's stored in localStorage rather than synced
+// through Supabase — a voice picked on one device might not even exist
+// on another.
+export function getSavedVoiceURI(): string {
+  if (typeof window === 'undefined') return '';
+  return window.localStorage.getItem(VOICE_STORAGE_KEY) ?? '';
+}
+
+export function setSavedVoiceURI(voiceURI: string) {
+  if (typeof window === 'undefined') return;
+  if (voiceURI === '') {
+    window.localStorage.removeItem(VOICE_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(VOICE_STORAGE_KEY, voiceURI);
+  }
+}
+
+// Keeps only English voices (lang codes starting with "en", e.g. "en-US",
+// "en-GB", "en-AU") — the venue only needs English announcements, so
+// filtering here keeps the dropdown short instead of listing every
+// language the device happens to have installed.
+function filterEnglishVoices(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice[] {
+  return voices.filter((voice) => voice.lang.toLowerCase().startsWith('en'));
+}
+
+// Voices often load asynchronously in the browser — the very first call
+// can return an empty list even though voices are on their way. This
+// waits for the browser's "voiceschanged" signal if nothing is ready yet.
+export function getAvailableVoices(): Promise<SpeechSynthesisVoice[]> {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      resolve([]);
+      return;
+    }
+
+    const existing = window.speechSynthesis.getVoices();
+    if (existing.length > 0) {
+      resolve(filterEnglishVoices(existing));
+      return;
+    }
+
+    window.speechSynthesis.onvoiceschanged = () => {
+      resolve(filterEnglishVoices(window.speechSynthesis.getVoices()));
+    };
+  });
+}
+
 // Returns a promise that resolves once the browser has finished speaking
 // this utterance — lets callers wait for one announcement to fully finish
 // before starting the next one.
@@ -24,6 +74,15 @@ export function speak(text: string): Promise<void> {
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 0.95;
     utterance.pitch = 1;
+
+    const savedVoiceURI = getSavedVoiceURI();
+    if (savedVoiceURI) {
+      const match = window.speechSynthesis
+        .getVoices()
+        .find((v) => v.voiceURI === savedVoiceURI);
+      if (match) utterance.voice = match;
+    }
+
     utterance.onend = () => resolve();
     utterance.onerror = () => resolve();
     window.speechSynthesis.speak(utterance);

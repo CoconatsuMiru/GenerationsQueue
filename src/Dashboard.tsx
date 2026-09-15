@@ -12,6 +12,7 @@ const WARMUP_MINUTES = 3;
 const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500; // pause after each court announcement finishes, before the next one
+const FIRST_CALL_REPEAT_PAUSE_MS = 400; // brief gap between the two repeats of a first-time call
 
 interface DashboardProps {
   session: Session;
@@ -326,11 +327,12 @@ function Dashboard({ session }: DashboardProps) {
   // Fills empty courts ONE AT A TIME instead of all at once. For each open
   // court: assigns players in the DB, updates local state immediately so
   // the loop can keep going without waiting on the realtime round trip,
-  // announces the lineup by voice, and only moves to the next open court
-  // after that announcement has fully finished playing (plus a short
-  // pause). This is what stops multiple "Court X..." announcements from
-  // overlapping or talking over each other when several courts are empty
-  // at once (e.g. right when a session starts).
+  // announces the lineup by voice (calling twice, like paging someone in
+  // person), and only moves to the next open court after that
+  // announcement has fully finished playing (plus a short pause). This is
+  // what stops multiple "Court X..." announcements from overlapping or
+  // talking over each other when several courts are empty at once (e.g.
+  // right when a session starts).
   async function runAssignmentLoop() {
     isAssigning.current = true;
 
@@ -382,7 +384,13 @@ function Dashboard({ session }: DashboardProps) {
 
         if (voiceEnabled && isSpeechSupported()) {
           const names = group.map((p) => p.name).join(', ');
-          await speak(`${openCourt.name}. ${names}.`);
+          const announcement = `${openCourt.name}. ${names}.`;
+          // Call players twice, like paging someone in person — makes it
+          // much more likely they actually catch their name the first
+          // time around.
+          await speak(announcement);
+          await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
+          await speak(announcement);
           await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
         }
       }
@@ -427,6 +435,13 @@ function Dashboard({ session }: DashboardProps) {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, courts, voiceEnabled, timeBased]);
+
+  function handleAnnounceCourt(courtId: number) {
+    const court = courts.find((c) => c.id === courtId);
+    if (!court || court.players.length === 0) return;
+    const names = court.players.map((p) => p.name).join(', ');
+    speak(`${court.name}. ${names}.`);
+  }
 
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
@@ -882,7 +897,7 @@ function Dashboard({ session }: DashboardProps) {
 
         <div>
           <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
             {courts.map((court) => (
               <CourtCard
                 key={court.id}
@@ -892,6 +907,7 @@ function Dashboard({ session }: DashboardProps) {
                 overtimeMinutes={OVERTIME_MINUTES}
                 timeBased={timeBased}
                 onEndGame={handleEndGame}
+                onAnnounce={handleAnnounceCourt}
               />
             ))}
           </div>

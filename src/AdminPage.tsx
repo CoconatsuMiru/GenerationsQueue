@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from './supabaseClient';
 import type { VenueSettings, Court } from './types';
+import { getAvailableVoices, getSavedVoiceURI, setSavedVoiceURI, speak, isSpeechSupported } from './speech';
 
 function AdminPage() {
   const navigate = useNavigate();
@@ -17,6 +18,9 @@ function AdminPage() {
   const [editingCourtId, setEditingCourtId] = useState<number | null>(null);
   const [editingName, setEditingName] = useState('');
 
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState('');
+
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
@@ -25,6 +29,8 @@ function AdminPage() {
   useEffect(() => {
     loadSettings();
     loadCourts();
+    setSelectedVoiceURI(getSavedVoiceURI());
+    getAvailableVoices().then(setVoices);
   }, []);
 
   async function loadSettings() {
@@ -185,6 +191,15 @@ function AdminPage() {
     loadCourts();
   }
 
+  function handleVoiceChange(uri: string) {
+    setSelectedVoiceURI(uri);
+    setSavedVoiceURI(uri);
+  }
+
+  function handleTestVoice() {
+    speak('Court 1. Alex, Jamie, Taylor, Morgan.');
+  }
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-100">
@@ -242,6 +257,38 @@ function AdminPage() {
               : 'Courts stay live with no timer — an organizer taps "End Game" on the court to send it back to the queue. Timer settings below are ignored in this mode.'}
           </p>
         </div>
+
+        {/* Voice settings */}
+        {isSpeechSupported() && (
+          <div className="bg-white rounded-2xl shadow-xl p-6">
+            <h2 className="text-xl font-extrabold text-gray-800 mb-1">Voice Settings</h2>
+            <p className="text-sm text-gray-400 mb-4">
+              Choose which voice reads out court announcements on this device. Available voices depend on
+              the device and browser.
+            </p>
+
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <select
+                value={selectedVoiceURI}
+                onChange={(e) => handleVoiceChange(e.target.value)}
+                className="w-full sm:flex-1 sm:min-w-0 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 truncate"
+              >
+                <option value="">Browser Default</option>
+                {voices.map((voice) => (
+                  <option key={voice.voiceURI} value={voice.voiceURI}>
+                    {voice.name} ({voice.lang})
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={handleTestVoice}
+                className="w-full sm:w-auto whitespace-nowrap bg-green-600 hover:bg-green-700 text-white font-semibold text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                🔊 Test
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Timer settings */}
         <div className={`bg-white rounded-2xl shadow-xl p-6 transition-opacity ${settings.timeBased ? '' : 'opacity-50'}`}>

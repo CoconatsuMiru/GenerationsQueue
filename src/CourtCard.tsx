@@ -1,4 +1,5 @@
 import type { Court } from './types';
+import { isSpeechSupported } from './speech';
 
 interface CourtCardProps {
   court: Court;
@@ -7,11 +8,12 @@ interface CourtCardProps {
   overtimeMinutes: number;
   timeBased: boolean;
   onEndGame: (courtId: number) => void;
+  onAnnounce: (courtId: number) => void;
 }
 
 type Phase = 'open' | 'warmup' | 'playing' | 'overtime';
 
-function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, timeBased, onEndGame }: CourtCardProps) {
+function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, timeBased, onEndGame, onAnnounce }: CourtCardProps) {
   const phase = getPhase(court, warmupMinutes, gameLengthMinutes, timeBased);
 
   const cardBg =
@@ -98,6 +100,15 @@ function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, t
                 {getTimeDisplay(court.startTime, gameLengthMinutes, warmupMinutes, overtimeMinutes)}
               </p>
             </div>
+          )}
+
+          {isSpeechSupported() && (
+            <button
+              onClick={() => onAnnounce(court.id)}
+              className="w-full bg-blue-500 hover:bg-blue-600 active:scale-[0.98] text-white text-sm font-semibold py-2 rounded-lg transition-all mb-2"
+            >
+              🔊 Call Players
+            </button>
           )}
 
           <button
