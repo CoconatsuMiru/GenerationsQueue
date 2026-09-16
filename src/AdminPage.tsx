@@ -95,7 +95,7 @@ function AdminPage() {
       (data ?? []).filter((c) => (c.player_ids ?? []).length > 0).map((c) => c.id)
     );
 
-    setCourts(mapped.map((c) => ({ ...c, players: occupied.has(c.id) ? [{ id: -1, name: '', partnerId: null }] : [] })));
+    setCourts(mapped.map((c) => ({ ...c, players: occupied.has(c.id) ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0 }] : [] })));
   }
 
   async function handleSaveSettings() {
