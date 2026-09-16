@@ -32,12 +32,6 @@ function buildUnits(players: Player[]): Player[][] {
 
       if (partner && !consumed.has(partner.id)) {
         if (partnerIndex > i) {
-          // The partner is still further back in the queue — hold off on
-          // forming this pair until we reach the partner's own position,
-          // so the pair's spot reflects the LATER (slower) partner's
-          // place in line, not the earlier one's. This stops pairing
-          // from letting a duo jump ahead of unpaired players who are
-          // actually queued between the two partners.
           continue;
         }
 
@@ -101,13 +95,6 @@ function shuffleArray<T>(array: T[]): T[] {
 
 let lastQueuePosition = 0;
 
-// Date.now() alone has millisecond resolution, so two positions requested
-// close together (e.g. two courts finishing within the same millisecond)
-// could collide and tie. A tie means the database is free to return those
-// rows in a different order on every reload, which is exactly what looks
-// like the queue "randomly shuffling." This guarantees every value handed
-// out is strictly greater than the last one, eliminating that tie at the
-// source.
 function nextQueuePosition(): number {
   const now = Date.now();
   lastQueuePosition = now > lastQueuePosition ? now : lastQueuePosition + 1;
@@ -145,6 +132,29 @@ function Dashboard({ session }: DashboardProps) {
   const playersRef = useRef<Player[]>(players);
   const courtsRef = useRef<Court[]>(courts);
   const pendingRerun = useRef(false);
+
+  // A single serialized queue that every function which mutates the
+  // players/courts arrays must go through. Without this, two mutations
+  // (e.g. the court-assignment loop, which deliberately runs slowly
+  // because it waits for voice announcements to finish, and a manual
+  // "End Game" click happening in the middle of that wait) could each
+  // work from a different snapshot of the queue at the same time — that's
+  // what caused players to get pulled into the wrong group or silently
+  // dropped into the wrong stack. Every locked function below also reads
+  // its starting data from playersRef/courtsRef (the freshest known
+  // state) rather than from whatever was captured when it was first
+  // called, since a function that was waiting in this queue could
+  // otherwise act on stale data by the time it's actually its turn to run.
+  const mutationLock = useRef<Promise<void>>(Promise.resolve());
+
+  function runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const result = mutationLock.current.then(fn, fn);
+    mutationLock.current = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
 
   useEffect(() => {
     const intervalId = setInterval(() => {
@@ -276,7 +286,12 @@ function Dashboard({ session }: DashboardProps) {
     function scheduleReload() {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        loadData();
+        // Routed through the same lock as every mutation, so a background
+        // refresh can never read the database mid-way through another
+        // function's sequence of writes (e.g. partway through requeuing
+        // four players after a game ends) and apply an inconsistent,
+        // half-finished snapshot to the screen.
+        runExclusive(loadData);
       }, 250);
     }
 
@@ -312,16 +327,27 @@ function Dashboard({ session }: DashboardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, courts, isSessionActive]);
 
-  // Guarded entry point. If a run is already in progress (e.g. still
-  // announcing a different court), this doesn't get dropped — it just
-  // flags that another check is needed, and the in-progress run picks it
-  // up as soon as it finishes.
+  // Guarded entry point for the reactive assignment check. Many rapid
+  // triggers (the effect above fires on every players/courts change,
+  // including the ones the assignment loop causes itself) are coalesced
+  // into at most one extra run, via pendingRerun. The loop's actual body
+  // now runs through runExclusive, so it can never overlap with End Game,
+  // Skip, Shuffle, Pair/Unpair, Remove, or Add running at the same time.
   function triggerAssignOpenCourts() {
     if (isAssigning.current) {
       pendingRerun.current = true;
       return;
     }
-    runAssignmentLoop();
+
+    isAssigning.current = true;
+    runExclusive(runAssignmentLoop).finally(() => {
+      isAssigning.current = false;
+
+      if (pendingRerun.current) {
+        pendingRerun.current = false;
+        triggerAssignOpenCourts();
+      }
+    });
   }
 
   // Fills empty courts ONE AT A TIME instead of all at once. For each open
@@ -329,79 +355,61 @@ function Dashboard({ session }: DashboardProps) {
   // the loop can keep going without waiting on the realtime round trip,
   // announces the lineup by voice (calling twice, like paging someone in
   // person), and only moves to the next open court after that
-  // announcement has fully finished playing (plus a short pause). This is
-  // what stops multiple "Court X..." announcements from overlapping or
-  // talking over each other when several courts are empty at once (e.g.
-  // right when a session starts).
+  // announcement has fully finished playing (plus a short pause).
+  //
+  // This entire function now always runs inside the mutationLock (see
+  // triggerAssignOpenCourts above), so nothing else can mutate the queue
+  // out from under it during the multi-second announcement pauses — this
+  // is the fix for players getting pulled from the wrong stack or dropped
+  // when a game ended while a different court was still being announced.
   async function runAssignmentLoop() {
-    isAssigning.current = true;
+    let remainingPlayers = playersRef.current;
+    let remainingCourts = courtsRef.current;
 
-    try {
-      // Read from refs, not the players/courts captured in this function's
-      // closure — refs always hold the latest state, so if another court
-      // was freed up (e.g. handleEndGame ran) while a previous run was
-      // still busy, a fresh run picks it up correctly instead of working
-      // off an outdated snapshot.
-      let remainingPlayers = playersRef.current;
-      let remainingCourts = courtsRef.current;
+    while (true) {
+      const openCourt = remainingCourts.find((c) => c.players.length === 0);
+      if (!openCourt) break;
 
-      while (true) {
-        const openCourt = remainingCourts.find((c) => c.players.length === 0);
-        if (!openCourt) break;
+      const units = buildUnits(remainingPlayers);
+      const { group } = selectNextGroup(units, 4);
+      if (group.length < 4) break;
 
-        const units = buildUnits(remainingPlayers);
-        const { group } = selectNextGroup(units, 4);
-        if (group.length < 4) break;
+      const startTimeIso = new Date().toISOString();
 
-        const startTimeIso = new Date().toISOString();
+      const { error } = await supabase
+        .from('courts')
+        .update({
+          player_ids: group.map((p) => p.id),
+          start_time: startTimeIso,
+        })
+        .eq('id', openCourt.id);
 
-        const { error } = await supabase
-          .from('courts')
-          .update({
-            player_ids: group.map((p) => p.id),
-            start_time: startTimeIso,
-          })
-          .eq('id', openCourt.id);
-
-        if (error) {
-          console.error('Error assigning court:', error);
-          break;
-        }
-
-        const startTimeMs = new Date(startTimeIso).getTime();
-        announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
-
-        const assignedIds = new Set(group.map((p) => p.id));
-        remainingPlayers = remainingPlayers.filter((p) => !assignedIds.has(p.id));
-        remainingCourts = remainingCourts.map((c) =>
-          c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
-        );
-
-        playersRef.current = remainingPlayers;
-        courtsRef.current = remainingCourts;
-        setPlayers(remainingPlayers);
-        setCourts(remainingCourts);
-
-        if (voiceEnabled && isSpeechSupported()) {
-          const names = group.map((p) => p.name).join(', ');
-          const announcement = `${openCourt.name}. ${names}.`;
-          // Call players twice, like paging someone in person — makes it
-          // much more likely they actually catch their name the first
-          // time around.
-          await speak(announcement);
-          await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
-          await speak(announcement);
-          await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
-        }
+      if (error) {
+        console.error('Error assigning court:', error);
+        break;
       }
-    } finally {
-      isAssigning.current = false;
 
-      // If a check got dropped while this run was busy, run it now — this
-      // is what catches "ended court 3 while court 2 was still filling."
-      if (pendingRerun.current) {
-        pendingRerun.current = false;
-        runAssignmentLoop();
+      const startTimeMs = new Date(startTimeIso).getTime();
+      announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
+
+      const assignedIds = new Set(group.map((p) => p.id));
+      remainingPlayers = remainingPlayers.filter((p) => !assignedIds.has(p.id));
+      remainingCourts = remainingCourts.map((c) =>
+        c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
+      );
+
+      playersRef.current = remainingPlayers;
+      courtsRef.current = remainingCourts;
+      setPlayers(remainingPlayers);
+      setCourts(remainingCourts);
+
+      if (voiceEnabled && isSpeechSupported()) {
+        const names = group.map((p) => p.name).join(', ');
+        const announcement = `${openCourt.name}. ${names}.`;
+        await speak(announcement);
+        await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
+        await speak(announcement);
+        await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
       }
     }
   }
@@ -417,7 +425,6 @@ function Dashboard({ session }: DashboardProps) {
       const elapsedMs = Date.now() - court.startTime;
       const key = `${court.id}-${court.startTime}`;
 
-      // Announce overtime once, right when the game clock crosses into it.
       if (voiceEnabled && elapsedMs >= gameEndMs && elapsedMs < totalMs) {
         if (!announcedOvertime.current.has(key)) {
           announcedOvertime.current.add(key);
@@ -446,21 +453,26 @@ function Dashboard({ session }: DashboardProps) {
   async function handleAddPlayer() {
     if (nameInput.trim() === '') return;
     const userId = session.user.id;
-
-    const { data, error } = await supabase
-      .from('players')
-      .insert({ name: nameInput, queue_position: nextQueuePosition(), owner_id: userId })
-      .select()
-      .single();
-
-    if (error) {
-      console.error('Error adding player:', error);
-      return;
-    }
-
-    const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
-    setPlayers((prev) => [...prev, newPlayer]);
+    const name = nameInput;
     setNameInput('');
+
+    await runExclusive(async () => {
+      const { data, error } = await supabase
+        .from('players')
+        .insert({ name, queue_position: nextQueuePosition(), owner_id: userId })
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error adding player:', error);
+        return;
+      }
+
+      const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
+      const updated = [...playersRef.current, newPlayer];
+      playersRef.current = updated;
+      setPlayers(updated);
+    });
   }
 
   function handleNameInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -479,174 +491,193 @@ function Dashboard({ session }: DashboardProps) {
 
     if (names.length === 0) return;
 
-    const rowsToInsert = names.map((name) => ({
-      name,
-      queue_position: nextQueuePosition(),
-      owner_id: userId,
-    }));
-
-    const { data, error } = await supabase
-      .from('players')
-      .insert(rowsToInsert)
-      .select();
-
-    if (error) {
-      console.error('Error adding batch players:', error);
-      return;
-    }
-
-    const newPlayers: Player[] = (data ?? []).map((p) => ({
-      id: p.id,
-      name: p.name,
-      partnerId: p.partner_id,
-    }));
-
-    setPlayers((prev) => [...prev, ...newPlayers]);
     setBatchInput('');
     setShowBatchModal(false);
+
+    await runExclusive(async () => {
+      const rowsToInsert = names.map((name) => ({
+        name,
+        queue_position: nextQueuePosition(),
+        owner_id: userId,
+      }));
+
+      const { data, error } = await supabase
+        .from('players')
+        .insert(rowsToInsert)
+        .select();
+
+      if (error) {
+        console.error('Error adding batch players:', error);
+        return;
+      }
+
+      const newPlayers: Player[] = (data ?? []).map((p) => ({
+        id: p.id,
+        name: p.name,
+        partnerId: p.partner_id,
+      }));
+
+      const updated = [...playersRef.current, ...newPlayers];
+      playersRef.current = updated;
+      setPlayers(updated);
+    });
   }
 
   async function handleRemovePlayer(id: number) {
-    const player = players.find((p) => p.id === id);
+    await runExclusive(async () => {
+      const player = playersRef.current.find((p) => p.id === id);
 
-    if (player?.partnerId !== null && player?.partnerId !== undefined) {
-      const { error: unpairError } = await supabase
-        .from('players')
-        .update({ partner_id: null })
-        .eq('id', player.partnerId);
-      if (unpairError) console.error('Error clearing partner link:', unpairError);
-    }
+      if (player?.partnerId !== null && player?.partnerId !== undefined) {
+        const { error: unpairError } = await supabase
+          .from('players')
+          .update({ partner_id: null })
+          .eq('id', player.partnerId);
+        if (unpairError) console.error('Error clearing partner link:', unpairError);
+      }
 
-    const { error } = await supabase.from('players').delete().eq('id', id);
+      const { error } = await supabase.from('players').delete().eq('id', id);
 
-    if (error) {
-      console.error('Error removing player:', error);
-      return;
-    }
+      if (error) {
+        console.error('Error removing player:', error);
+        return;
+      }
 
-    setPlayers((prev) =>
-      prev
+      const updated = playersRef.current
         .filter((p) => p.id !== id)
-        .map((p) => (p.id === player?.partnerId ? { ...p, partnerId: null } : p))
-    );
+        .map((p) => (p.id === player?.partnerId ? { ...p, partnerId: null } : p));
+
+      playersRef.current = updated;
+      setPlayers(updated);
+    });
   }
 
   async function handleSkipPlayer(id: number) {
-    const player = players.find((p) => p.id === id);
-    if (!player) return;
+    await runExclusive(async () => {
+      const player = playersRef.current.find((p) => p.id === id);
+      if (!player) return;
 
-    const idsToSkip = player.partnerId !== null ? [id, player.partnerId] : [id];
+      const idsToSkip = player.partnerId !== null ? [id, player.partnerId] : [id];
 
-    for (const skipId of idsToSkip) {
-      const { error } = await supabase
-        .from('players')
-        .update({ queue_position: nextQueuePosition() })
-        .eq('id', skipId);
-      if (error) console.error('Error skipping player:', error);
-    }
+      for (const skipId of idsToSkip) {
+        const { error } = await supabase
+          .from('players')
+          .update({ queue_position: nextQueuePosition() })
+          .eq('id', skipId);
+        if (error) console.error('Error skipping player:', error);
+      }
 
-    setPlayers((prev) => {
-      const skipped = prev.filter((p) => idsToSkip.includes(p.id));
-      const remaining = prev.filter((p) => !idsToSkip.includes(p.id));
-      return [...remaining, ...skipped];
+      const skipped = playersRef.current.filter((p) => idsToSkip.includes(p.id));
+      const remaining = playersRef.current.filter((p) => !idsToSkip.includes(p.id));
+      const updated = [...remaining, ...skipped];
+
+      playersRef.current = updated;
+      setPlayers(updated);
     });
   }
 
   async function handleShuffleQueue() {
-    if (players.length === 0) return;
+    await runExclusive(async () => {
+      if (playersRef.current.length === 0) return;
 
-    // Shuffle at the unit level (pairs move together, singles move alone)
-    // rather than shuffling individual players, so a paired duo never
-    // gets split apart by the shuffle.
-    const units = buildUnits(players);
-    const shuffledUnits = shuffleArray(units);
+      // Shuffle at the unit level (pairs move together, singles move
+      // alone) rather than shuffling individual players, so a paired duo
+      // never gets split apart by the shuffle.
+      const units = buildUnits(playersRef.current);
+      const shuffledUnits = shuffleArray(units);
 
-    const newOrder: Player[] = [];
-    const updates: { id: number; queue_position: number }[] = [];
+      const newOrder: Player[] = [];
+      const updates: { id: number; queue_position: number }[] = [];
 
-    shuffledUnits.forEach((unit) => {
-      unit.forEach((player) => {
-        newOrder.push(player);
-        updates.push({ id: player.id, queue_position: nextQueuePosition() });
+      shuffledUnits.forEach((unit) => {
+        unit.forEach((player) => {
+          newOrder.push(player);
+          updates.push({ id: player.id, queue_position: nextQueuePosition() });
+        });
       });
-    });
 
-    // Sequential per-row updates instead of a single upsert — this matches
-    // the pattern handleSkipPlayer already uses successfully, sidestepping
-    // whatever was causing the batched upsert to silently fail.
-    for (const update of updates) {
-      const { error } = await supabase
-        .from('players')
-        .update({ queue_position: update.queue_position })
-        .eq('id', update.id);
+      for (const update of updates) {
+        const { error } = await supabase
+          .from('players')
+          .update({ queue_position: update.queue_position })
+          .eq('id', update.id);
 
-      if (error) {
-        console.error('Error shuffling queue:', error);
-        return;
+        if (error) {
+          console.error('Error shuffling queue:', error);
+          return;
+        }
       }
-    }
 
-    setPlayers(newOrder);
+      playersRef.current = newOrder;
+      setPlayers(newOrder);
+    });
   }
 
   async function handleEndGame(courtId: number) {
-    const court = courts.find((c) => c.id === courtId);
-    if (!court) return;
+    await runExclusive(async () => {
+      const court = courtsRef.current.find((c) => c.id === courtId);
+      if (!court) return;
 
-    const { error: courtError } = await supabase
-      .from('courts')
-      .update({ player_ids: [], start_time: null })
-      .eq('id', courtId);
+      const { error: courtError } = await supabase
+        .from('courts')
+        .update({ player_ids: [], start_time: null })
+        .eq('id', courtId);
 
-    if (courtError) console.error('Error ending game:', courtError);
+      if (courtError) console.error('Error ending game:', courtError);
 
-    // Figure out whether the current tail of the queue is a short stack
-    // (fewer than 4 players) BEFORE these returning players rejoin. If it
-    // is, backfill that gap first with a random subset of the returning
-    // group, so the short stack actually completes instead of sitting
-    // there forever while every future arrival just gets appended after it.
-    const waitingUnits = buildUnits(players);
-    const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
-    const lastStack = waitingStacks[waitingStacks.length - 1];
-    const vacancies = lastStack ? 4 - lastStack.length : 0;
+      // Figure out whether the current tail of the queue is a short stack
+      // (fewer than 4 players) BEFORE these returning players rejoin. If
+      // it is, backfill that gap first with a random subset of the
+      // returning group, so the short stack actually completes instead of
+      // sitting there forever while every future arrival just gets
+      // appended after it. Always leftover players (not used for
+      // backfill) form a brand-new, intact stack at the very end — they
+      // are never split across multiple stacks or merged into an earlier
+      // one beyond filling that single vacancy.
+      //
+      // Reads from playersRef/courtsRef (not closed-over `players`/
+      // `courts` variables) so this always works from the true current
+      // queue, even if this call had to wait its turn in the mutation
+      // lock before actually running.
+      const waitingUnits = buildUnits(playersRef.current);
+      const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
+      const lastStack = waitingStacks[waitingStacks.length - 1];
+      const vacancies = lastStack ? 4 - lastStack.length : 0;
 
-    let backfill: Player[] = [];
-    let leftover: Player[] = court.players;
+      let backfill: Player[] = [];
+      let leftover: Player[] = court.players;
 
-    if (vacancies > 0 && court.players.length > 0) {
-      const shuffled = shuffleArray(court.players);
-      const count = Math.min(vacancies, shuffled.length);
-      backfill = shuffled.slice(0, count);
-      leftover = shuffled.slice(count);
-    }
+      if (vacancies > 0 && court.players.length > 0) {
+        const shuffled = shuffleArray(court.players);
+        const count = Math.min(vacancies, shuffled.length);
+        backfill = shuffled.slice(0, count);
+        leftover = shuffled.slice(count);
+      }
 
-    // Sequential per-row updates instead of a batched upsert — this is the
-    // fix: a batched .upsert() here was silently failing to persist the
-    // new queue_position values, so the very next realtime reload would
-    // snap the queue back to its old order, undoing the backfill/shuffle
-    // that had just happened on screen. Sequential updates are what
-    // handleSkipPlayer and handleShuffleQueue already use successfully.
-    //
-    // Order matters: backfill players are written FIRST so they get the
-    // lower/earlier queue_position values, landing them right after the
-    // existing short stack. Leftover players are written after, forming a
-    // fresh stack behind everyone else.
-    const orderedRequeue = [...backfill, ...leftover];
-    for (const player of orderedRequeue) {
-      const { error: requeueError } = await supabase
-        .from('players')
-        .update({ queue_position: nextQueuePosition() })
-        .eq('id', player.id);
+      // Sequential per-row updates (a batched upsert here was previously
+      // found to silently fail to persist). Backfill players are written
+      // FIRST so they get the earlier queue_position values, landing them
+      // right after the existing short stack. Leftover players are
+      // written after, forming a fresh, intact stack behind everyone else.
+      const orderedRequeue = [...backfill, ...leftover];
+      for (const player of orderedRequeue) {
+        const { error: requeueError } = await supabase
+          .from('players')
+          .update({ queue_position: nextQueuePosition() })
+          .eq('id', player.id);
 
-      if (requeueError) console.error('Error requeuing player:', requeueError);
-    }
+        if (requeueError) console.error('Error requeuing player:', requeueError);
+      }
 
-    setPlayers((prev) => [...prev, ...backfill, ...leftover]);
-    setCourts((prev) =>
-      prev.map((c) =>
+      const updatedPlayers = [...playersRef.current, ...backfill, ...leftover];
+      const updatedCourts = courtsRef.current.map((c) =>
         c.id === courtId ? { ...c, players: [], startTime: null } : c
-      )
-    );
+      );
+
+      playersRef.current = updatedPlayers;
+      courtsRef.current = updatedCourts;
+      setPlayers(updatedPlayers);
+      setCourts(updatedCourts);
+    });
   }
 
   async function handleResetSession() {
@@ -657,24 +688,28 @@ function Dashboard({ session }: DashboardProps) {
     );
     if (!confirmed) return;
 
-    const { error: deletePlayersError } = await supabase
-      .from('players')
-      .delete()
-      .eq('owner_id', userId);
+    await runExclusive(async () => {
+      const { error: deletePlayersError } = await supabase
+        .from('players')
+        .delete()
+        .eq('owner_id', userId);
 
-    const { error: resetCourtsError } = await supabase
-      .from('courts')
-      .update({ player_ids: [], start_time: null })
-      .eq('owner_id', userId);
+      const { error: resetCourtsError } = await supabase
+        .from('courts')
+        .update({ player_ids: [], start_time: null })
+        .eq('owner_id', userId);
 
-    const { error: resetSessionError } = await supabase
-      .from('session_state')
-      .update({ is_active: false })
-      .eq('owner_id', userId);
+      const { error: resetSessionError } = await supabase
+        .from('session_state')
+        .update({ is_active: false })
+        .eq('owner_id', userId);
 
-    if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
-    if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
-    if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
+      if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
+      if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
+      if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
+
+      await loadData();
+    });
   }
 
   async function handleToggleSession() {
@@ -695,41 +730,49 @@ function Dashboard({ session }: DashboardProps) {
   async function handlePairPlayers(idA: number, idB: number) {
     if (idA === idB) return;
 
-    const { error: errA } = await supabase.from('players').update({ partner_id: idB }).eq('id', idA);
-    const { error: errB } = await supabase.from('players').update({ partner_id: idA }).eq('id', idB);
+    await runExclusive(async () => {
+      const { error: errA } = await supabase.from('players').update({ partner_id: idB }).eq('id', idA);
+      const { error: errB } = await supabase.from('players').update({ partner_id: idA }).eq('id', idB);
 
-    if (errA || errB) {
-      console.error('Error pairing players:', errA || errB);
-      return;
-    }
+      if (errA || errB) {
+        console.error('Error pairing players:', errA || errB);
+        return;
+      }
 
-    setPlayers((prev) =>
-      prev.map((p) => {
+      const updated = playersRef.current.map((p) => {
         if (p.id === idA) return { ...p, partnerId: idB };
         if (p.id === idB) return { ...p, partnerId: idA };
         return p;
-      })
-    );
-    setPairingSourceId(null);
+      });
+
+      playersRef.current = updated;
+      setPlayers(updated);
+      setPairingSourceId(null);
+    });
   }
 
   async function handleUnpairPlayer(id: number) {
-    const player = players.find((p) => p.id === id);
-    if (!player || player.partnerId === null) return;
+    await runExclusive(async () => {
+      const player = playersRef.current.find((p) => p.id === id);
+      if (!player || player.partnerId === null) return;
 
-    const partnerId = player.partnerId;
+      const partnerId = player.partnerId;
 
-    const { error: errA } = await supabase.from('players').update({ partner_id: null }).eq('id', id);
-    const { error: errB } = await supabase.from('players').update({ partner_id: null }).eq('id', partnerId);
+      const { error: errA } = await supabase.from('players').update({ partner_id: null }).eq('id', id);
+      const { error: errB } = await supabase.from('players').update({ partner_id: null }).eq('id', partnerId);
 
-    if (errA || errB) {
-      console.error('Error unpairing players:', errA || errB);
-      return;
-    }
+      if (errA || errB) {
+        console.error('Error unpairing players:', errA || errB);
+        return;
+      }
 
-    setPlayers((prev) =>
-      prev.map((p) => (p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p))
-    );
+      const updated = playersRef.current.map((p) =>
+        p.id === id || p.id === partnerId ? { ...p, partnerId: null } : p
+      );
+
+      playersRef.current = updated;
+      setPlayers(updated);
+    });
   }
 
   const units = buildUnits(players);
