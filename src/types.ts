@@ -2,6 +2,7 @@ export interface Player {
   id: number;
   name: string;
   partnerId: number | null;
+  gamesPlayed: number;
 }
 
 export interface Court {
@@ -24,6 +25,7 @@ export interface DbPlayer {
   name: string;
   queue_position: number;
   partner_id: number | null;
+  games_played: number;
 }
 
 export interface DbCourt {
@@ -44,4 +46,11 @@ export interface DbVenueSettings {
   game_minutes: number;
   overtime_minutes: number;
   time_based: boolean;
+}
+
+export interface DbGroupHistory {
+  owner_id: string;
+  player_a_id: number;
+  player_b_id: number;
+  count: number;
 }

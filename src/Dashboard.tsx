@@ -13,6 +13,7 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
+const FAIRNESS_POOL_TARGET_PLAYERS = 8; // how many players deep to look when picking a fair group
 
 interface DashboardProps {
   session: Session;
@@ -101,6 +102,122 @@ function nextQueuePosition(): number {
   return lastQueuePosition;
 }
 
+function pairKey(idA: number, idB: number): string {
+  return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
+}
+
+// Builds a small forward-looking pool of units (roughly the front
+// FAIRNESS_POOL_TARGET_PLAYERS players' worth, not just 4) so the
+// fairness scoring below has a handful of realistic groupings to choose
+// from, without scanning the whole queue and drifting far from FIFO.
+function buildCandidatePool(units: Player[][], targetPlayers: number): Player[][] {
+  const pool: Player[][] = [];
+  let total = 0;
+  for (const unit of units) {
+    if (total >= targetPlayers) break;
+    pool.push(unit);
+    total += unit.length;
+  }
+  return pool;
+}
+
+// A unit's "games played" for tiering is the MAX across its members
+// (rather than an average) — this way a pair only counts as part of the
+// lowest tier when BOTH partners are equally under-played, so a
+// veteran+newcomer pair can't sneak in ahead of two equally-fresh
+// newcomers.
+function unitGamesPlayed(unit: Player[]): number {
+  return Math.max(...unit.map((p) => p.gamesPlayed));
+}
+
+// Picks the tier of units with the fewest games played, expanding to
+// include the next tier(s) up if there aren't yet 4 players' worth of
+// units in the lowest tier — this is what stops a court from stalling
+// just because very few "freshest" players happen to be waiting.
+function selectFairnessTier(pool: Player[][]): Player[][] {
+  const sorted = [...pool].sort((a, b) => unitGamesPlayed(a) - unitGamesPlayed(b));
+  const tier: Player[][] = [];
+  let total = 0;
+  let currentValue: number | null = null;
+
+  for (const unit of sorted) {
+    const value = unitGamesPlayed(unit);
+    if (currentValue === null) currentValue = value;
+
+    if (value !== currentValue && total >= 4) break;
+
+    tier.push(unit);
+    total += unit.length;
+    currentValue = value;
+  }
+
+  return tier;
+}
+
+// Generates a small handful of valid 4-player groupings by sliding the
+// starting point within the fairness tier a few times (rather than
+// exhaustively combining every possibility) — cheap, and stays close to
+// FIFO order within the tier. Reuses selectNextGroup's unit-fitting logic
+// so pairs still land in the same group of 4 together.
+function generateCandidateGroups(tierUnits: Player[][]): Player[][] {
+  const candidates: Player[][] = [];
+  const seen = new Set<string>();
+  const maxStarts = Math.min(tierUnits.length, 5);
+
+  for (let start = 0; start < maxStarts; start++) {
+    const { group } = selectNextGroup(tierUnits.slice(start), 4);
+    if (group.length < 4) continue;
+
+    const key = group.map((p) => p.id).sort((a, b) => a - b).join(',');
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    candidates.push(group);
+  }
+
+  return candidates;
+}
+
+function scoreGroup(group: Player[], groupHistory: Map<string, number>): number {
+  let score = 0;
+  for (let i = 0; i < group.length; i++) {
+    for (let j = i + 1; j < group.length; j++) {
+      score += groupHistory.get(pairKey(group[i].id, group[j].id)) ?? 0;
+    }
+  }
+  return score;
+}
+
+// Chooses which 4 players get the next open court: pulls a small
+// forward-looking pool from the front of the queue, narrows to whichever
+// units have played the fewest games so far (expanding tiers as needed so
+// a court never stalls), generates a handful of valid groupings from that
+// tier, and picks whichever grouping has played together least often
+// before. Ties are broken randomly. Returns null if there aren't yet 4
+// players available to form any group.
+function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): Player[] | null {
+  const units = buildUnits(players);
+  const pool = buildCandidatePool(units, FAIRNESS_POOL_TARGET_PLAYERS);
+
+  const totalPoolPlayers = pool.reduce((sum, unit) => sum + unit.length, 0);
+  if (totalPoolPlayers < 4) return null;
+
+  const tier = selectFairnessTier(pool);
+  const candidates = generateCandidateGroups(tier);
+  if (candidates.length === 0) return null;
+
+  const scored = candidates.map((group) => ({
+    group,
+    score: scoreGroup(group, groupHistory),
+  }));
+
+  const lowestScore = Math.min(...scored.map((s) => s.score));
+  const bestCandidates = scored.filter((s) => s.score === lowestScore);
+  const chosen = shuffleArray(bestCandidates)[0];
+
+  return chosen.group;
+}
+
 function Dashboard({ session }: DashboardProps) {
   const navigate = useNavigate();
 
@@ -126,11 +243,6 @@ function Dashboard({ session }: DashboardProps) {
   const announcedAssignments = useRef<Set<string>>(new Set());
   const announcedOvertime = useRef<Set<string>>(new Set());
 
-  // isAssigning now only guards the announcement/loop-continuation
-  // sequence from being re-entered concurrently (so two announcement
-  // cycles never overlap) — it does NOT block other actions like End Game
-  // or Skip, since those only go through mutationLock, which is held for
-  // a much shorter time (see processNextAssignment below).
   const isAssigning = useRef(false);
   const autoEndingCourts = useRef<Set<number>>(new Set());
 
@@ -138,12 +250,12 @@ function Dashboard({ session }: DashboardProps) {
   const courtsRef = useRef<Court[]>(courts);
   const pendingRerun = useRef(false);
 
-  // Serializes the actual data-mutating step of every queue operation —
-  // this is what guarantees two mutations never read-decide-write against
-  // two different snapshots of the queue at the same time (the bug behind
-  // players getting pulled from the wrong stack). Kept deliberately fast:
-  // it wraps the database write + local state update only, never a voice
-  // announcement, so it's never held for more than a fraction of a second.
+  // In-memory cache of pairwise "played together" counts, keyed by
+  // pairKey(idA, idB). Loaded fresh in loadData() and kept in sync
+  // locally as new assignments happen, so scoring inside
+  // processNextAssignment never needs an extra DB round trip.
+  const groupHistoryRef = useRef<Map<string, number>>(new Map());
+
   const mutationLock = useRef<Promise<void>>(Promise.resolve());
 
   function runExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -246,13 +358,20 @@ function Dashboard({ session }: DashboardProps) {
       .eq('owner_id', userId)
       .order('id', { ascending: true });
 
+    const { data: dbGroupHistory, error: groupHistoryError } = await supabase
+      .from('group_history')
+      .select('*')
+      .eq('owner_id', userId);
+
     if (playersError) console.error('Error loading players:', playersError);
     if (courtsError) console.error('Error loading courts:', courtsError);
+    if (groupHistoryError) console.error('Error loading group history:', groupHistoryError);
 
     const allPlayers: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
       name: p.name,
       partnerId: p.partner_id,
+      gamesPlayed: p.games_played ?? 0,
     }));
 
     const playingIds = new Set(
@@ -266,6 +385,12 @@ function Dashboard({ session }: DashboardProps) {
       players: allPlayers.filter((p) => (c.player_ids ?? []).includes(p.id)),
       startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
+
+    const historyMap = new Map<string, number>();
+    (dbGroupHistory ?? []).forEach((row) => {
+      historyMap.set(pairKey(row.player_a_id, row.player_b_id), row.count);
+    });
+    groupHistoryRef.current = historyMap;
 
     setPlayers(waitingPlayers);
     setCourts(mappedCourts);
@@ -321,11 +446,6 @@ function Dashboard({ session }: DashboardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, courts, isSessionActive]);
 
-  // Entry point for the reactive assignment check. isAssigning guards
-  // against this whole multi-court fill-and-announce sequence being
-  // re-entered while it's already running (so announcements never
-  // overlap) — but note it does NOT hold the mutationLock, so other
-  // actions (End Game, Skip, etc.) remain free to run immediately.
   function triggerAssignOpenCourts() {
     if (isAssigning.current) {
       pendingRerun.current = true;
@@ -335,26 +455,20 @@ function Dashboard({ session }: DashboardProps) {
     processNextAssignment();
   }
 
-  // Handles ONE court at a time. The actual decide-and-write step runs
-  // inside runExclusive and is fast — it reads the freshest known queue
-  // (via refs), picks the next full group, writes to Supabase, and
-  // updates local state, then immediately releases the lock. The voice
-  // announcement (which can take several seconds, since it calls the
-  // group twice) happens AFTER the lock is released, so an End Game click
-  // arriving during the announcement no longer has to wait for it —
-  // it just runs in its own turn through the same lock, in a fraction of
-  // a second. Once the announcement finishes, this checks whether another
-  // court also needs filling and repeats; when there's nothing left to
-  // do, it clears isAssigning so a future queue/court change can trigger
-  // this again.
+  // Handles ONE court at a time. The decide-and-write step (now including
+  // the fairness-based group selection, plus the games_played and
+  // group_history bookkeeping) runs inside runExclusive and stays fast —
+  // it reads the freshest known queue via refs, picks a group, writes to
+  // Supabase, updates local state, then immediately releases the lock.
+  // The voice announcement happens AFTER the lock is released, so other
+  // actions (End Game, Skip, etc.) never have to wait for it.
   async function processNextAssignment() {
     const assignment = await runExclusive(async () => {
       const openCourt = courtsRef.current.find((c) => c.players.length === 0);
       if (!openCourt) return null;
 
-      const units = buildUnits(playersRef.current);
-      const { group } = selectNextGroup(units, 4);
-      if (group.length < 4) return null;
+      const group = chooseFairGroup(playersRef.current, groupHistoryRef.current);
+      if (!group) return null;
 
       const startTimeIso = new Date().toISOString();
 
@@ -373,6 +487,44 @@ function Dashboard({ session }: DashboardProps) {
 
       const startTimeMs = new Date(startTimeIso).getTime();
       announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
+
+      // Fairness bookkeeping: bump games_played for the 4 assigned
+      // players, and bump the repeat-grouping count for every pairwise
+      // combination among them. Sequential single-row writes — a
+      // batched multi-row upsert was previously found to silently fail
+      // to persist for this project.
+      for (const player of group) {
+        const newGamesPlayed = player.gamesPlayed + 1;
+        const { error: gamesPlayedError } = await supabase
+          .from('players')
+          .update({ games_played: newGamesPlayed })
+          .eq('id', player.id);
+        if (gamesPlayedError) console.error('Error updating games_played:', gamesPlayedError);
+      }
+
+      for (let i = 0; i < group.length; i++) {
+        for (let j = i + 1; j < group.length; j++) {
+          const idA = group[i].id;
+          const idB = group[j].id;
+          const key = pairKey(idA, idB);
+          const newCount = (groupHistoryRef.current.get(key) ?? 0) + 1;
+          const [playerAId, playerBId] = idA < idB ? [idA, idB] : [idB, idA];
+
+          const { error: historyError } = await supabase.from('group_history').upsert(
+            {
+              owner_id: session.user.id,
+              player_a_id: playerAId,
+              player_b_id: playerBId,
+              count: newCount,
+            },
+            { onConflict: 'owner_id,player_a_id,player_b_id' }
+          );
+
+          if (historyError) console.error('Error updating group_history:', historyError);
+
+          groupHistoryRef.current.set(key, newCount);
+        }
+      }
 
       const assignedIds = new Set(group.map((p) => p.id));
       const updatedPlayers = playersRef.current.filter((p) => !assignedIds.has(p.id));
@@ -398,7 +550,6 @@ function Dashboard({ session }: DashboardProps) {
     }
 
     if (assignment) {
-      // Another court might also be open — keep going.
       processNextAssignment();
       return;
     }
@@ -465,7 +616,12 @@ function Dashboard({ session }: DashboardProps) {
         return;
       }
 
-      const newPlayer: Player = { id: data.id, name: data.name, partnerId: data.partner_id };
+      const newPlayer: Player = {
+        id: data.id,
+        name: data.name,
+        partnerId: data.partner_id,
+        gamesPlayed: data.games_played ?? 0,
+      };
       const updated = [...playersRef.current, newPlayer];
       playersRef.current = updated;
       setPlayers(updated);
@@ -512,6 +668,7 @@ function Dashboard({ session }: DashboardProps) {
         id: p.id,
         name: p.name,
         partnerId: p.partner_id,
+        gamesPlayed: p.games_played ?? 0,
       }));
 
       const updated = [...playersRef.current, ...newPlayers];
@@ -679,9 +836,15 @@ function Dashboard({ session }: DashboardProps) {
         .update({ is_active: false })
         .eq('owner_id', userId);
 
+      const { error: resetHistoryError } = await supabase
+        .from('group_history')
+        .delete()
+        .eq('owner_id', userId);
+
       if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
       if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
       if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
+      if (resetHistoryError) console.error('Error clearing group history:', resetHistoryError);
 
       await loadData();
     });
