@@ -11,8 +11,8 @@ const GAME_LENGTH_MINUTES = 15;
 const WARMUP_MINUTES = 3;
 const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
-const ANNOUNCE_PAUSE_MS = 1500; // pause after each court announcement finishes, before the next one
-const FIRST_CALL_REPEAT_PAUSE_MS = 400; // brief gap between the two repeats of a first-time call
+const ANNOUNCE_PAUSE_MS = 1500;
+const FIRST_CALL_REPEAT_PAUSE_MS = 400;
 
 interface DashboardProps {
   session: Session;
@@ -126,6 +126,11 @@ function Dashboard({ session }: DashboardProps) {
   const announcedAssignments = useRef<Set<string>>(new Set());
   const announcedOvertime = useRef<Set<string>>(new Set());
 
+  // isAssigning now only guards the announcement/loop-continuation
+  // sequence from being re-entered concurrently (so two announcement
+  // cycles never overlap) — it does NOT block other actions like End Game
+  // or Skip, since those only go through mutationLock, which is held for
+  // a much shorter time (see processNextAssignment below).
   const isAssigning = useRef(false);
   const autoEndingCourts = useRef<Set<number>>(new Set());
 
@@ -133,18 +138,12 @@ function Dashboard({ session }: DashboardProps) {
   const courtsRef = useRef<Court[]>(courts);
   const pendingRerun = useRef(false);
 
-  // A single serialized queue that every function which mutates the
-  // players/courts arrays must go through. Without this, two mutations
-  // (e.g. the court-assignment loop, which deliberately runs slowly
-  // because it waits for voice announcements to finish, and a manual
-  // "End Game" click happening in the middle of that wait) could each
-  // work from a different snapshot of the queue at the same time — that's
-  // what caused players to get pulled into the wrong group or silently
-  // dropped into the wrong stack. Every locked function below also reads
-  // its starting data from playersRef/courtsRef (the freshest known
-  // state) rather than from whatever was captured when it was first
-  // called, since a function that was waiting in this queue could
-  // otherwise act on stale data by the time it's actually its turn to run.
+  // Serializes the actual data-mutating step of every queue operation —
+  // this is what guarantees two mutations never read-decide-write against
+  // two different snapshots of the queue at the same time (the bug behind
+  // players getting pulled from the wrong stack). Kept deliberately fast:
+  // it wraps the database write + local state update only, never a voice
+  // announcement, so it's never held for more than a fraction of a second.
   const mutationLock = useRef<Promise<void>>(Promise.resolve());
 
   function runExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -286,11 +285,6 @@ function Dashboard({ session }: DashboardProps) {
     function scheduleReload() {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        // Routed through the same lock as every mutation, so a background
-        // refresh can never read the database mid-way through another
-        // function's sequence of writes (e.g. partway through requeuing
-        // four players after a game ends) and apply an inconsistent,
-        // half-finished snapshot to the screen.
         runExclusive(loadData);
       }, 250);
     }
@@ -327,52 +321,40 @@ function Dashboard({ session }: DashboardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [players, courts, isSessionActive]);
 
-  // Guarded entry point for the reactive assignment check. Many rapid
-  // triggers (the effect above fires on every players/courts change,
-  // including the ones the assignment loop causes itself) are coalesced
-  // into at most one extra run, via pendingRerun. The loop's actual body
-  // now runs through runExclusive, so it can never overlap with End Game,
-  // Skip, Shuffle, Pair/Unpair, Remove, or Add running at the same time.
+  // Entry point for the reactive assignment check. isAssigning guards
+  // against this whole multi-court fill-and-announce sequence being
+  // re-entered while it's already running (so announcements never
+  // overlap) — but note it does NOT hold the mutationLock, so other
+  // actions (End Game, Skip, etc.) remain free to run immediately.
   function triggerAssignOpenCourts() {
     if (isAssigning.current) {
       pendingRerun.current = true;
       return;
     }
-
     isAssigning.current = true;
-    runExclusive(runAssignmentLoop).finally(() => {
-      isAssigning.current = false;
-
-      if (pendingRerun.current) {
-        pendingRerun.current = false;
-        triggerAssignOpenCourts();
-      }
-    });
+    processNextAssignment();
   }
 
-  // Fills empty courts ONE AT A TIME instead of all at once. For each open
-  // court: assigns players in the DB, updates local state immediately so
-  // the loop can keep going without waiting on the realtime round trip,
-  // announces the lineup by voice (calling twice, like paging someone in
-  // person), and only moves to the next open court after that
-  // announcement has fully finished playing (plus a short pause).
-  //
-  // This entire function now always runs inside the mutationLock (see
-  // triggerAssignOpenCourts above), so nothing else can mutate the queue
-  // out from under it during the multi-second announcement pauses — this
-  // is the fix for players getting pulled from the wrong stack or dropped
-  // when a game ended while a different court was still being announced.
-  async function runAssignmentLoop() {
-    let remainingPlayers = playersRef.current;
-    let remainingCourts = courtsRef.current;
+  // Handles ONE court at a time. The actual decide-and-write step runs
+  // inside runExclusive and is fast — it reads the freshest known queue
+  // (via refs), picks the next full group, writes to Supabase, and
+  // updates local state, then immediately releases the lock. The voice
+  // announcement (which can take several seconds, since it calls the
+  // group twice) happens AFTER the lock is released, so an End Game click
+  // arriving during the announcement no longer has to wait for it —
+  // it just runs in its own turn through the same lock, in a fraction of
+  // a second. Once the announcement finishes, this checks whether another
+  // court also needs filling and repeats; when there's nothing left to
+  // do, it clears isAssigning so a future queue/court change can trigger
+  // this again.
+  async function processNextAssignment() {
+    const assignment = await runExclusive(async () => {
+      const openCourt = courtsRef.current.find((c) => c.players.length === 0);
+      if (!openCourt) return null;
 
-    while (true) {
-      const openCourt = remainingCourts.find((c) => c.players.length === 0);
-      if (!openCourt) break;
-
-      const units = buildUnits(remainingPlayers);
+      const units = buildUnits(playersRef.current);
       const { group } = selectNextGroup(units, 4);
-      if (group.length < 4) break;
+      if (group.length < 4) return null;
 
       const startTimeIso = new Date().toISOString();
 
@@ -386,31 +368,46 @@ function Dashboard({ session }: DashboardProps) {
 
       if (error) {
         console.error('Error assigning court:', error);
-        break;
+        return null;
       }
 
       const startTimeMs = new Date(startTimeIso).getTime();
       announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
 
       const assignedIds = new Set(group.map((p) => p.id));
-      remainingPlayers = remainingPlayers.filter((p) => !assignedIds.has(p.id));
-      remainingCourts = remainingCourts.map((c) =>
+      const updatedPlayers = playersRef.current.filter((p) => !assignedIds.has(p.id));
+      const updatedCourts = courtsRef.current.map((c) =>
         c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
       );
 
-      playersRef.current = remainingPlayers;
-      courtsRef.current = remainingCourts;
-      setPlayers(remainingPlayers);
-      setCourts(remainingCourts);
+      playersRef.current = updatedPlayers;
+      courtsRef.current = updatedCourts;
+      setPlayers(updatedPlayers);
+      setCourts(updatedCourts);
 
-      if (voiceEnabled && isSpeechSupported()) {
-        const names = group.map((p) => p.name).join(', ');
-        const announcement = `${openCourt.name}. ${names}.`;
-        await speak(announcement);
-        await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
-        await speak(announcement);
-        await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
-      }
+      return { court: openCourt, group };
+    });
+
+    if (assignment && voiceEnabled && isSpeechSupported()) {
+      const names = assignment.group.map((p) => p.name).join(', ');
+      const announcement = `${assignment.court.name}. ${names}.`;
+      await speak(announcement);
+      await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
+      await speak(announcement);
+      await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
+    }
+
+    if (assignment) {
+      // Another court might also be open — keep going.
+      processNextAssignment();
+      return;
+    }
+
+    isAssigning.current = false;
+
+    if (pendingRerun.current) {
+      pendingRerun.current = false;
+      triggerAssignOpenCourts();
     }
   }
 
@@ -579,9 +576,6 @@ function Dashboard({ session }: DashboardProps) {
     await runExclusive(async () => {
       if (playersRef.current.length === 0) return;
 
-      // Shuffle at the unit level (pairs move together, singles move
-      // alone) rather than shuffling individual players, so a paired duo
-      // never gets split apart by the shuffle.
       const units = buildUnits(playersRef.current);
       const shuffledUnits = shuffleArray(units);
 
@@ -624,20 +618,6 @@ function Dashboard({ session }: DashboardProps) {
 
       if (courtError) console.error('Error ending game:', courtError);
 
-      // Figure out whether the current tail of the queue is a short stack
-      // (fewer than 4 players) BEFORE these returning players rejoin. If
-      // it is, backfill that gap first with a random subset of the
-      // returning group, so the short stack actually completes instead of
-      // sitting there forever while every future arrival just gets
-      // appended after it. Always leftover players (not used for
-      // backfill) form a brand-new, intact stack at the very end — they
-      // are never split across multiple stacks or merged into an earlier
-      // one beyond filling that single vacancy.
-      //
-      // Reads from playersRef/courtsRef (not closed-over `players`/
-      // `courts` variables) so this always works from the true current
-      // queue, even if this call had to wait its turn in the mutation
-      // lock before actually running.
       const waitingUnits = buildUnits(playersRef.current);
       const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
       const lastStack = waitingStacks[waitingStacks.length - 1];
@@ -653,11 +633,6 @@ function Dashboard({ session }: DashboardProps) {
         leftover = shuffled.slice(count);
       }
 
-      // Sequential per-row updates (a batched upsert here was previously
-      // found to silently fail to persist). Backfill players are written
-      // FIRST so they get the earlier queue_position values, landing them
-      // right after the existing short stack. Leftover players are
-      // written after, forming a fresh, intact stack behind everyone else.
       const orderedRequeue = [...backfill, ...leftover];
       for (const player of orderedRequeue) {
         const { error: requeueError } = await supabase
