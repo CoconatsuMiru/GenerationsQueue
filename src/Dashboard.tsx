@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './App.css';
 import type { Player, Court, SkillLevel } from './types';
+import { SkillBadge, SKILL_LEVELS } from './skillLevels';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
 import { speak, isSpeechSupported, primeSpeechOnFirstInteraction } from './speech';
@@ -15,26 +16,6 @@ const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
 const FAIRNESS_POOL_TARGET_PLAYERS = 8;
 const LEADERBOARD_SIZE = 8;
-
-const SKILL_LEVELS: SkillLevel[] = ['beginner', 'intermediate', 'advanced'];
-
-const SKILL_BADGE: Record<SkillLevel, { label: string; classes: string }> = {
-  beginner: { label: 'B', classes: 'bg-gray-200 text-gray-600' },
-  intermediate: { label: 'I', classes: 'bg-blue-100 text-blue-600' },
-  advanced: { label: 'A', classes: 'bg-purple-100 text-purple-600' },
-};
-
-function SkillBadge({ level }: { level: SkillLevel }) {
-  const badge = SKILL_BADGE[level];
-  return (
-    <span
-      className={`shrink-0 text-[10px] font-bold w-4 h-4 rounded-full flex items-center justify-center ${badge.classes}`}
-      title={level}
-    >
-      {badge.label}
-    </span>
-  );
-}
 
 interface DashboardProps {
   session: Session;
@@ -142,10 +123,6 @@ function unitGamesPlayed(unit: Player[]): number {
   return Math.max(...unit.map((p) => p.gamesPlayed));
 }
 
-// A unit only "counts" as a given skill level if EVERY member of it shares
-// that level — a mixed-level pair returns null, meaning it can never be
-// part of a pure same-level group (it will only ever be picked up by the
-// mixed-level fallback pass below).
 function unitSkillLevel(unit: Player[]): SkillLevel | null {
   if (unit.length === 1) return unit[0].skillLevel;
   return unit[0].skillLevel === unit[1].skillLevel ? unit[0].skillLevel : null;
@@ -210,18 +187,16 @@ function pickLowestScored(
   return shuffleArray(best)[0].group;
 }
 
-// Chooses which 4 players get the next open court.
+// Chooses which 4 players get the next open court (Fair Queueing mode).
 //
 // Pass 1 (skill matching): pulls a forward-looking pool from the front of
 // the queue, then tries — in the order skill levels first appear in that
 // pool (so it still leans FIFO) — to fill a court entirely from ONE skill
-// level. Within whichever level has enough players, the existing
-// games-played fairness tiering and repeat-grouping history scoring apply
-// exactly as before, just scoped to that level's players.
+// level. Within whichever level has enough players, games-played fairness
+// tiering and repeat-grouping history scoring apply.
 //
-// Pass 2 (fallback): if no single skill level has 4 players available
-// near the front of the queue, mixes levels rather than leaving a court
-// empty — using the same fairness + history scoring across the whole pool.
+// Pass 2 (fallback): if no single skill level has 4 players available near
+// the front of the queue, mixes levels rather than leaving a court empty.
 function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): Player[] | null {
   const units = buildUnits(players);
   const pool = buildCandidatePool(units, FAIRNESS_POOL_TARGET_PLAYERS);
@@ -247,7 +222,6 @@ function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): 
     return pickLowestScored(candidates, groupHistory);
   }
 
-  // Fallback: mix levels.
   const tier = selectFairnessTier(pool);
   const candidates = generateCandidateGroups(tier);
   if (candidates.length === 0) return null;
@@ -278,6 +252,10 @@ function Dashboard({ session }: DashboardProps) {
   const [isSessionActive, setIsSessionActive] = useState(false);
 
   const [timeBased, setTimeBased] = useState(true);
+  const [warmupMinutes, setWarmupMinutes] = useState(WARMUP_MINUTES);
+  const [gameMinutes, setGameMinutes] = useState(GAME_LENGTH_MINUTES);
+  const [overtimeMinutes, setOvertimeMinutes] = useState(OVERTIME_MINUTES);
+  const [queueMode, setQueueMode] = useState<'fifo' | 'fair'>('fair');
 
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const announcedAssignments = useRef<Set<string>>(new Set());
@@ -358,13 +336,17 @@ function Dashboard({ session }: DashboardProps) {
 
     const { data: venueSettings, error: venueSettingsError } = await supabase
       .from('venue_settings')
-      .select('time_based')
+      .select('time_based, warmup_minutes, game_minutes, overtime_minutes, queue_mode')
       .eq('owner_id', userId)
       .maybeSingle();
 
     if (venueSettingsError) console.error('Error loading venue settings:', venueSettingsError);
 
     setTimeBased(venueSettings?.time_based ?? true);
+    setWarmupMinutes(venueSettings?.warmup_minutes ?? WARMUP_MINUTES);
+    setGameMinutes(venueSettings?.game_minutes ?? GAME_LENGTH_MINUTES);
+    setOvertimeMinutes(venueSettings?.overtime_minutes ?? OVERTIME_MINUTES);
+    setQueueMode((venueSettings?.queue_mode as 'fifo' | 'fair') ?? 'fair');
 
     if (isNewAccount) {
       const { data: existingCourts } = await supabase
@@ -469,6 +451,11 @@ function Dashboard({ session }: DashboardProps) {
         { event: '*', schema: 'public', table: 'session_state', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'venue_settings', filter: `owner_id=eq.${userId}` },
+        scheduleReload
+      )
       .subscribe();
 
     return () => {
@@ -498,7 +485,13 @@ function Dashboard({ session }: DashboardProps) {
       const openCourt = courtsRef.current.find((c) => c.players.length === 0);
       if (!openCourt) return null;
 
-      const group = chooseFairGroup(playersRef.current, groupHistoryRef.current);
+      const group =
+        queueMode === 'fifo'
+          ? (() => {
+              const { group: fifoGroup } = selectNextGroup(buildUnits(playersRef.current), 4);
+              return fifoGroup.length === 4 ? fifoGroup : null;
+            })()
+          : chooseFairGroup(playersRef.current, groupHistoryRef.current);
       if (!group) return null;
 
       const startTimeIso = new Date().toISOString();
@@ -558,19 +551,13 @@ function Dashboard({ session }: DashboardProps) {
         c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
       );
 
-      // Bump games_played locally too, both for the waiting-queue removal
-      // and for allPlayers, so the leaderboard reflects the new count
-      // immediately instead of waiting for the next realtime reload.
       const bumped = new Map(group.map((p) => [p.id, p.gamesPlayed + 1]));
-      const updatedAllPlayers = allPlayersRefSnapshot().map((p) =>
-        bumped.has(p.id) ? { ...p, gamesPlayed: bumped.get(p.id)! } : p
-      );
 
       playersRef.current = updatedPlayers;
       courtsRef.current = updatedCourts;
       setPlayers(updatedPlayers);
       setCourts(updatedCourts);
-      setAllPlayers(updatedAllPlayers);
+      setAllPlayers((prev) => prev.map((p) => (bumped.has(p.id) ? { ...p, gamesPlayed: bumped.get(p.id)! } : p)));
 
       return { court: openCourt, group };
     });
@@ -597,24 +584,11 @@ function Dashboard({ session }: DashboardProps) {
     }
   }
 
-  // Small helper so processNextAssignment can read the latest allPlayers
-  // without adding another ref-sync effect — allPlayers changes far less
-  // often than players/courts, so a plain closure-safe read via functional
-  // state update covers it without extra bookkeeping.
-  function allPlayersRefSnapshot(): Player[] {
-    let snapshot: Player[] = [];
-    setAllPlayers((prev) => {
-      snapshot = prev;
-      return prev;
-    });
-    return snapshot;
-  }
-
   useEffect(() => {
     if (!timeBased) return;
 
-    const gameEndMs = (WARMUP_MINUTES + GAME_LENGTH_MINUTES) * 60 * 1000;
-    const totalMs = gameEndMs + OVERTIME_MINUTES * 60 * 1000;
+    const gameEndMs = (warmupMinutes + gameMinutes) * 60 * 1000;
+    const totalMs = gameEndMs + overtimeMinutes * 60 * 1000;
 
     courts.forEach((court) => {
       if (court.startTime === null) return;
@@ -637,7 +611,7 @@ function Dashboard({ session }: DashboardProps) {
       });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, courts, voiceEnabled, timeBased]);
+  }, [tick, courts, voiceEnabled, timeBased, warmupMinutes, gameMinutes, overtimeMinutes]);
 
   function handleAnnounceCourt(courtId: number) {
     const court = courts.find((c) => c.id === courtId);
@@ -974,6 +948,20 @@ function Dashboard({ session }: DashboardProps) {
     });
   }
 
+  async function handleChangeSkillLevel(id: number, level: SkillLevel) {
+    const { error } = await supabase.from('players').update({ skill_level: level }).eq('id', id);
+
+    if (error) {
+      console.error('Error updating skill level:', error);
+      return;
+    }
+
+    const applyLevel = (p: Player) => (p.id === id ? { ...p, skillLevel: level } : p);
+    playersRef.current = playersRef.current.map(applyLevel);
+    setPlayers((prev) => prev.map(applyLevel));
+    setAllPlayers((prev) => prev.map(applyLevel));
+  }
+
   const units = buildUnits(players);
   const queueStacks = buildQueueGroups(units, 4, MAX_QUEUE_STACKS);
   const courtsInPlay = courts.filter((c) => c.players.length > 0).length;
@@ -1145,7 +1133,7 @@ function Dashboard({ session }: DashboardProps) {
           </div>
           <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-3 sm:p-4 text-center">
             <p className="text-2xl sm:text-3xl font-extrabold text-gray-800">
-              {timeBased ? `${GAME_LENGTH_MINUTES}m` : 'Manual'}
+              {timeBased ? `${gameMinutes}m` : 'Manual'}
             </p>
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mt-1">
               {timeBased ? 'Game Timer' : 'Game Mode'}
@@ -1161,9 +1149,9 @@ function Dashboard({ session }: DashboardProps) {
                 <CourtCard
                   key={court.id}
                   court={court}
-                  gameLengthMinutes={GAME_LENGTH_MINUTES}
-                  warmupMinutes={WARMUP_MINUTES}
-                  overtimeMinutes={OVERTIME_MINUTES}
+                  gameLengthMinutes={gameMinutes}
+                  warmupMinutes={warmupMinutes}
+                  overtimeMinutes={overtimeMinutes}
                   timeBased={timeBased}
                   onEndGame={handleEndGame}
                   onAnnounce={handleAnnounceCourt}
@@ -1201,7 +1189,7 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         </div>
 
-        {queueStacks.length > 0 && (
+        {queueMode === 'fifo' && queueStacks.length > 0 && (
           <div className="mt-8">
             <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
               Upcoming Stacks
@@ -1398,11 +1386,33 @@ function Dashboard({ session }: DashboardProps) {
                         </div>
                         <div className="flex items-center justify-between mb-1">
                           <span className="flex items-center gap-1.5 text-sm font-medium text-gray-800 truncate">
-                            <SkillBadge level={unit[0].skillLevel} />
+                            <select
+                              value={unit[0].skillLevel}
+                              onChange={(e) => handleChangeSkillLevel(unit[0].id, e.target.value as SkillLevel)}
+                              onClick={(e) => e.stopPropagation()}
+                              className="text-[10px] font-bold border-0 bg-transparent px-0 py-0 focus:outline-none focus:ring-0 cursor-pointer"
+                            >
+                              {SKILL_LEVELS.map((lvl) => (
+                                <option key={lvl} value={lvl}>
+                                  {lvl.charAt(0).toUpperCase()}
+                                </option>
+                              ))}
+                            </select>
                             {unit[0].name}
                           </span>
                           <span className="flex items-center gap-1.5 text-sm font-medium text-gray-800 truncate">
-                            <SkillBadge level={unit[1].skillLevel} />
+                            <select
+                              value={unit[1].skillLevel}
+                              onChange={(e) => handleChangeSkillLevel(unit[1].id, e.target.value as SkillLevel)}
+                              onClick={(e) => e.stopPropagation()}
+                              className="text-[10px] font-bold border-0 bg-transparent px-0 py-0 focus:outline-none focus:ring-0 cursor-pointer"
+                            >
+                              {SKILL_LEVELS.map((lvl) => (
+                                <option key={lvl} value={lvl}>
+                                  {lvl.charAt(0).toUpperCase()}
+                                </option>
+                              ))}
+                            </select>
                             {unit[1].name}
                           </span>
                         </div>
@@ -1439,7 +1449,18 @@ function Dashboard({ session }: DashboardProps) {
                         className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
                       >
                         <span className="flex items-center gap-1.5 text-gray-800 text-sm font-medium truncate">
-                          <SkillBadge level={unit[0].skillLevel} />
+                          <select
+                            value={unit[0].skillLevel}
+                            onChange={(e) => handleChangeSkillLevel(unit[0].id, e.target.value as SkillLevel)}
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-[10px] font-bold border-0 bg-transparent px-0 py-0 focus:outline-none focus:ring-0 cursor-pointer"
+                          >
+                            {SKILL_LEVELS.map((lvl) => (
+                              <option key={lvl} value={lvl}>
+                                {lvl.charAt(0).toUpperCase()}
+                              </option>
+                            ))}
+                          </select>
                           {unit[0].name}
                         </span>
                         <div className="flex gap-1.5 shrink-0 ml-2">

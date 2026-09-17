@@ -20,6 +20,7 @@ export interface VenueSettings {
   gameMinutes: number;
   overtimeMinutes: number;
   timeBased: boolean;
+  queueMode: 'fifo' | 'fair';
 }
 
 // Shapes matching the actual Supabase table rows
@@ -50,6 +51,7 @@ export interface DbVenueSettings {
   game_minutes: number;
   overtime_minutes: number;
   time_based: boolean;
+  queue_mode: 'fifo' | 'fair';
 }
 
 export interface DbGroupHistory {

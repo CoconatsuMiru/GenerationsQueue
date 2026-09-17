@@ -1,5 +1,6 @@
 import type { Court } from './types';
 import { isSpeechSupported } from './speech';
+import { SkillBadge } from './skillLevels';
 
 interface CourtCardProps {
   court: Court;
@@ -87,8 +88,9 @@ function CourtCard({ court, gameLengthMinutes, warmupMinutes, overtimeMinutes, t
             {court.players.map((player) => (
               <li
                 key={player.id}
-                className="text-sm font-medium text-gray-700 bg-white/70 rounded-md px-2 py-1 truncate"
+                className="flex items-center gap-1.5 text-sm font-medium text-gray-700 bg-white/70 rounded-md px-2 py-1 truncate"
               >
+                <SkillBadge level={player.skillLevel} />
                 {player.name}
               </li>
             ))}
@@ -161,8 +163,6 @@ function getTimeDisplay(
     return `${formatTime(gameRemainingSec)} remaining`;
   }
 
-  // Overtime: count up from when game time expired, and show how much
-  // buffer is left before the court auto-clears.
   const overtimeElapsedSec = totalElapsedSec - gameEndSec;
   const overtimeRemainingSec = Math.max(overtimeEndSec - totalElapsedSec, 0);
   return `+${formatTime(overtimeElapsedSec)} overtime · clears in ${formatTime(overtimeRemainingSec)}`;

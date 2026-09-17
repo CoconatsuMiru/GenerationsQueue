@@ -12,6 +12,7 @@ function AdminPage() {
     gameMinutes: 15,
     overtimeMinutes: 2,
     timeBased: true,
+    queueMode: 'fair',
   });
   const [courts, setCourts] = useState<Court[]>([]);
   const [newCourtName, setNewCourtName] = useState('');
@@ -29,7 +30,6 @@ function AdminPage() {
   useEffect(() => {
     loadSettings();
     loadCourts();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedVoiceURI(getSavedVoiceURI());
     getAvailableVoices().then(setVoices);
   }, []);
@@ -53,6 +53,7 @@ function AdminPage() {
         gameMinutes: data.game_minutes,
         overtimeMinutes: data.overtime_minutes,
         timeBased: data.time_based ?? true,
+        queueMode: data.queue_mode ?? 'fair',
       });
     } else {
       const { error: createError } = await supabase.from('venue_settings').insert({
@@ -61,6 +62,7 @@ function AdminPage() {
         game_minutes: 15,
         overtime_minutes: 2,
         time_based: true,
+        queue_mode: 'fair',
       });
       if (createError) console.error('Error creating venue settings:', createError);
     }
@@ -96,7 +98,14 @@ function AdminPage() {
       (data ?? []).filter((c) => (c.player_ids ?? []).length > 0).map((c) => c.id)
     );
 
-    setCourts(mapped.map((c) => ({ ...c, players: occupied.has(c.id) ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const }] : [] })));
+    setCourts(
+      mapped.map((c) => ({
+        ...c,
+        players: occupied.has(c.id)
+          ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const }]
+          : [],
+      }))
+    );
   }
 
   async function handleSaveSettings() {
@@ -114,6 +123,7 @@ function AdminPage() {
         game_minutes: settings.gameMinutes,
         overtime_minutes: settings.overtimeMinutes,
         time_based: settings.timeBased,
+        queue_mode: settings.queueMode,
       })
       .eq('owner_id', userId);
 
@@ -256,6 +266,41 @@ function AdminPage() {
             {settings.timeBased
               ? 'Courts automatically clear once the timer below runs out.'
               : 'Courts stay live with no timer — an organizer taps "End Game" on the court to send it back to the queue. Timer settings below are ignored in this mode.'}
+          </p>
+        </div>
+
+        {/* Queue mode */}
+        <div className="bg-white rounded-2xl shadow-xl p-6">
+          <h2 className="text-xl font-extrabold text-gray-800 mb-1">Queue Mode</h2>
+          <p className="text-sm text-gray-400 mb-4">Choose how the next court's group of 4 is chosen.</p>
+
+          <div className="flex gap-2 mb-3">
+            <button
+              onClick={() => setSettings({ ...settings, queueMode: 'fifo' })}
+              className={`flex-1 text-sm font-semibold px-4 py-2.5 rounded-lg border transition-colors ${
+                settings.queueMode === 'fifo'
+                  ? 'bg-green-600 text-white border-green-600'
+                  : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+              }`}
+            >
+              FIFO
+            </button>
+            <button
+              onClick={() => setSettings({ ...settings, queueMode: 'fair' })}
+              className={`flex-1 text-sm font-semibold px-4 py-2.5 rounded-lg border transition-colors ${
+                settings.queueMode === 'fair'
+                  ? 'bg-green-600 text-white border-green-600'
+                  : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+              }`}
+            >
+              Fair Queueing
+            </button>
+          </div>
+
+          <p className="text-xs text-gray-400">
+            {settings.queueMode === 'fifo'
+              ? 'Strict first-come-first-served. The Upcoming Stacks list shows exactly who plays next.'
+              : 'Balances games played and skill level when picking the next group — the order can shift, so Upcoming Stacks is hidden in this mode.'}
           </p>
         </div>
 
