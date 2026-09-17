@@ -15,7 +15,7 @@ const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
 const FAIRNESS_POOL_TARGET_PLAYERS = 8;
-const LEADERBOARD_SIZE = 8;
+
 
 interface DashboardProps {
   session: Session;
@@ -247,7 +247,10 @@ function Dashboard({ session }: DashboardProps) {
 
   const [showQueueSidebar, setShowQueueSidebar] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [pairingSourceId, setPairingSourceId] = useState<number | null>(null);
+  const [pairingSourceId, setPairingSourceId] = useState<number | null>(null); 
+  
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [leaderboardSearch, setLeaderboardSearch] = useState('');
 
   const [isSessionActive, setIsSessionActive] = useState(false);
 
@@ -970,10 +973,9 @@ function Dashboard({ session }: DashboardProps) {
     unit.some((p) => p.name.toLowerCase().includes(searchTerm.trim().toLowerCase()))
   );
 
-  const leaderboard = [...allPlayers]
-    .filter((p) => p.gamesPlayed > 0)
-    .sort((a, b) => b.gamesPlayed - a.gamesPlayed)
-    .slice(0, LEADERBOARD_SIZE);
+  const leaderboardResults = [...allPlayers]
+  .filter((p) => p.name.toLowerCase().includes(leaderboardSearch.trim().toLowerCase()))
+  .sort((a, b) => b.gamesPlayed - a.gamesPlayed);
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -1160,32 +1162,68 @@ function Dashboard({ session }: DashboardProps) {
             </div>
           </div>
 
-          {/* Leaderboard */}
+{/* Games Played lookup */}
           <div>
-            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
-              🏆 Leaderboard
-            </h2>
-            <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
-              {leaderboard.length === 0 ? (
-                <p className="text-gray-300 text-sm">No games played yet</p>
-              ) : (
-                <ul className="space-y-2">
-                  {leaderboard.map((player, i) => (
-                    <li
-                      key={player.id}
-                      className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-xs font-bold text-gray-400 w-4 shrink-0">{i + 1}</span>
-                        <SkillBadge level={player.skillLevel} />
-                        <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
-                      </div>
-                      <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+            <button
+              onClick={() => setShowLeaderboard((v) => !v)}
+              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
+            >
+              <span>🏆 Games Played</span>
+              <svg
+                className={`w-4 h-4 transition-transform ${showLeaderboard ? 'rotate-180' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+
+            {showLeaderboard && (
+              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
+                <div className="relative mb-3">
+                  <svg
+                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <circle cx="11" cy="11" r="7" />
+                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
+                  </svg>
+                  <input
+                    type="text"
+                    value={leaderboardSearch}
+                    onChange={(e) => setLeaderboardSearch(e.target.value)}
+                    placeholder="Search players..."
+                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                  />
+                </div>
+
+                {leaderboardResults.length === 0 ? (
+                  <p className="text-gray-300 text-sm">
+                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
+                  </p>
+                ) : (
+                  <ul className="space-y-2 max-h-64 overflow-y-auto">
+                    {leaderboardResults.map((player) => (
+                      <li
+                        key={player.id}
+                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <SkillBadge level={player.skillLevel} />
+                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                        </div>
+                        <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
