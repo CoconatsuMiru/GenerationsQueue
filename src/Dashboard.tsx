@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './App.css';
-import type { Player, Court } from './types';
+import type { Player, Court, SkillLevel } from './types';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
 import { speak, isSpeechSupported, primeSpeechOnFirstInteraction } from './speech';
@@ -13,7 +13,28 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-const FAIRNESS_POOL_TARGET_PLAYERS = 8; // how many players deep to look when picking a fair group
+const FAIRNESS_POOL_TARGET_PLAYERS = 8;
+const LEADERBOARD_SIZE = 8;
+
+const SKILL_LEVELS: SkillLevel[] = ['beginner', 'intermediate', 'advanced'];
+
+const SKILL_BADGE: Record<SkillLevel, { label: string; classes: string }> = {
+  beginner: { label: 'B', classes: 'bg-gray-200 text-gray-600' },
+  intermediate: { label: 'I', classes: 'bg-blue-100 text-blue-600' },
+  advanced: { label: 'A', classes: 'bg-purple-100 text-purple-600' },
+};
+
+function SkillBadge({ level }: { level: SkillLevel }) {
+  const badge = SKILL_BADGE[level];
+  return (
+    <span
+      className={`shrink-0 text-[10px] font-bold w-4 h-4 rounded-full flex items-center justify-center ${badge.classes}`}
+      title={level}
+    >
+      {badge.label}
+    </span>
+  );
+}
 
 interface DashboardProps {
   session: Session;
@@ -106,10 +127,6 @@ function pairKey(idA: number, idB: number): string {
   return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
 }
 
-// Builds a small forward-looking pool of units (roughly the front
-// FAIRNESS_POOL_TARGET_PLAYERS players' worth, not just 4) so the
-// fairness scoring below has a handful of realistic groupings to choose
-// from, without scanning the whole queue and drifting far from FIFO.
 function buildCandidatePool(units: Player[][], targetPlayers: number): Player[][] {
   const pool: Player[][] = [];
   let total = 0;
@@ -121,19 +138,19 @@ function buildCandidatePool(units: Player[][], targetPlayers: number): Player[][
   return pool;
 }
 
-// A unit's "games played" for tiering is the MAX across its members
-// (rather than an average) — this way a pair only counts as part of the
-// lowest tier when BOTH partners are equally under-played, so a
-// veteran+newcomer pair can't sneak in ahead of two equally-fresh
-// newcomers.
 function unitGamesPlayed(unit: Player[]): number {
   return Math.max(...unit.map((p) => p.gamesPlayed));
 }
 
-// Picks the tier of units with the fewest games played, expanding to
-// include the next tier(s) up if there aren't yet 4 players' worth of
-// units in the lowest tier — this is what stops a court from stalling
-// just because very few "freshest" players happen to be waiting.
+// A unit only "counts" as a given skill level if EVERY member of it shares
+// that level — a mixed-level pair returns null, meaning it can never be
+// part of a pure same-level group (it will only ever be picked up by the
+// mixed-level fallback pass below).
+function unitSkillLevel(unit: Player[]): SkillLevel | null {
+  if (unit.length === 1) return unit[0].skillLevel;
+  return unit[0].skillLevel === unit[1].skillLevel ? unit[0].skillLevel : null;
+}
+
 function selectFairnessTier(pool: Player[][]): Player[][] {
   const sorted = [...pool].sort((a, b) => unitGamesPlayed(a) - unitGamesPlayed(b));
   const tier: Player[][] = [];
@@ -154,11 +171,6 @@ function selectFairnessTier(pool: Player[][]): Player[][] {
   return tier;
 }
 
-// Generates a small handful of valid 4-player groupings by sliding the
-// starting point within the fairness tier a few times (rather than
-// exhaustively combining every possibility) — cheap, and stays close to
-// FIFO order within the tier. Reuses selectNextGroup's unit-fitting logic
-// so pairs still land in the same group of 4 together.
 function generateCandidateGroups(tierUnits: Player[][]): Player[][] {
   const candidates: Player[][] = [];
   const seen = new Set<string>();
@@ -188,13 +200,28 @@ function scoreGroup(group: Player[], groupHistory: Map<string, number>): number 
   return score;
 }
 
-// Chooses which 4 players get the next open court: pulls a small
-// forward-looking pool from the front of the queue, narrows to whichever
-// units have played the fewest games so far (expanding tiers as needed so
-// a court never stalls), generates a handful of valid groupings from that
-// tier, and picks whichever grouping has played together least often
-// before. Ties are broken randomly. Returns null if there aren't yet 4
-// players available to form any group.
+function pickLowestScored(
+  candidates: Player[][],
+  groupHistory: Map<string, number>
+): Player[] {
+  const scored = candidates.map((group) => ({ group, score: scoreGroup(group, groupHistory) }));
+  const lowestScore = Math.min(...scored.map((s) => s.score));
+  const best = scored.filter((s) => s.score === lowestScore);
+  return shuffleArray(best)[0].group;
+}
+
+// Chooses which 4 players get the next open court.
+//
+// Pass 1 (skill matching): pulls a forward-looking pool from the front of
+// the queue, then tries — in the order skill levels first appear in that
+// pool (so it still leans FIFO) — to fill a court entirely from ONE skill
+// level. Within whichever level has enough players, the existing
+// games-played fairness tiering and repeat-grouping history scoring apply
+// exactly as before, just scoped to that level's players.
+//
+// Pass 2 (fallback): if no single skill level has 4 players available
+// near the front of the queue, mixes levels rather than leaving a court
+// empty — using the same fairness + history scoring across the whole pool.
 function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): Player[] | null {
   const units = buildUnits(players);
   const pool = buildCandidatePool(units, FAIRNESS_POOL_TARGET_PLAYERS);
@@ -202,27 +229,39 @@ function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): 
   const totalPoolPlayers = pool.reduce((sum, unit) => sum + unit.length, 0);
   if (totalPoolPlayers < 4) return null;
 
+  const seenLevels: SkillLevel[] = [];
+  for (const unit of pool) {
+    const level = unitSkillLevel(unit);
+    if (level && !seenLevels.includes(level)) seenLevels.push(level);
+  }
+
+  for (const level of seenLevels) {
+    const sameLevelUnits = pool.filter((u) => unitSkillLevel(u) === level);
+    const sameLevelTotal = sameLevelUnits.reduce((sum, u) => sum + u.length, 0);
+    if (sameLevelTotal < 4) continue;
+
+    const tier = selectFairnessTier(sameLevelUnits);
+    const candidates = generateCandidateGroups(tier);
+    if (candidates.length === 0) continue;
+
+    return pickLowestScored(candidates, groupHistory);
+  }
+
+  // Fallback: mix levels.
   const tier = selectFairnessTier(pool);
   const candidates = generateCandidateGroups(tier);
   if (candidates.length === 0) return null;
 
-  const scored = candidates.map((group) => ({
-    group,
-    score: scoreGroup(group, groupHistory),
-  }));
-
-  const lowestScore = Math.min(...scored.map((s) => s.score));
-  const bestCandidates = scored.filter((s) => s.score === lowestScore);
-  const chosen = shuffleArray(bestCandidates)[0];
-
-  return chosen.group;
+  return pickLowestScored(candidates, groupHistory);
 }
 
 function Dashboard({ session }: DashboardProps) {
   const navigate = useNavigate();
 
   const [players, setPlayers] = useState<Player[]>([]);
+  const [allPlayers, setAllPlayers] = useState<Player[]>([]); // full roster (waiting + playing), for the leaderboard
   const [nameInput, setNameInput] = useState('');
+  const [nameLevel, setNameLevel] = useState<SkillLevel>('beginner');
 
   const [courts, setCourts] = useState<Court[]>([]);
 
@@ -230,6 +269,7 @@ function Dashboard({ session }: DashboardProps) {
 
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchInput, setBatchInput] = useState('');
+  const [batchLevel, setBatchLevel] = useState<SkillLevel>('beginner');
 
   const [showQueueSidebar, setShowQueueSidebar] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -250,10 +290,6 @@ function Dashboard({ session }: DashboardProps) {
   const courtsRef = useRef<Court[]>(courts);
   const pendingRerun = useRef(false);
 
-  // In-memory cache of pairwise "played together" counts, keyed by
-  // pairKey(idA, idB). Loaded fresh in loadData() and kept in sync
-  // locally as new assignments happen, so scoring inside
-  // processNextAssignment never needs an extra DB round trip.
   const groupHistoryRef = useRef<Map<string, number>>(new Map());
 
   const mutationLock = useRef<Promise<void>>(Promise.resolve());
@@ -367,22 +403,23 @@ function Dashboard({ session }: DashboardProps) {
     if (courtsError) console.error('Error loading courts:', courtsError);
     if (groupHistoryError) console.error('Error loading group history:', groupHistoryError);
 
-    const allPlayers: Player[] = (dbPlayers ?? []).map((p) => ({
+    const allPlayersList: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
       name: p.name,
       partnerId: p.partner_id,
       gamesPlayed: p.games_played ?? 0,
+      skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
     }));
 
     const playingIds = new Set(
       (dbCourts ?? []).flatMap((c) => c.player_ids ?? [])
     );
-    const waitingPlayers = allPlayers.filter((p) => !playingIds.has(p.id));
+    const waitingPlayers = allPlayersList.filter((p) => !playingIds.has(p.id));
 
     const mappedCourts: Court[] = (dbCourts ?? []).map((c) => ({
       id: c.id,
       name: c.name,
-      players: allPlayers.filter((p) => (c.player_ids ?? []).includes(p.id)),
+      players: allPlayersList.filter((p) => (c.player_ids ?? []).includes(p.id)),
       startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
 
@@ -393,6 +430,7 @@ function Dashboard({ session }: DashboardProps) {
     groupHistoryRef.current = historyMap;
 
     setPlayers(waitingPlayers);
+    setAllPlayers(allPlayersList);
     setCourts(mappedCourts);
     setIsSessionActive(sessionActive);
   }
@@ -455,13 +493,6 @@ function Dashboard({ session }: DashboardProps) {
     processNextAssignment();
   }
 
-  // Handles ONE court at a time. The decide-and-write step (now including
-  // the fairness-based group selection, plus the games_played and
-  // group_history bookkeeping) runs inside runExclusive and stays fast —
-  // it reads the freshest known queue via refs, picks a group, writes to
-  // Supabase, updates local state, then immediately releases the lock.
-  // The voice announcement happens AFTER the lock is released, so other
-  // actions (End Game, Skip, etc.) never have to wait for it.
   async function processNextAssignment() {
     const assignment = await runExclusive(async () => {
       const openCourt = courtsRef.current.find((c) => c.players.length === 0);
@@ -488,11 +519,6 @@ function Dashboard({ session }: DashboardProps) {
       const startTimeMs = new Date(startTimeIso).getTime();
       announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
 
-      // Fairness bookkeeping: bump games_played for the 4 assigned
-      // players, and bump the repeat-grouping count for every pairwise
-      // combination among them. Sequential single-row writes — a
-      // batched multi-row upsert was previously found to silently fail
-      // to persist for this project.
       for (const player of group) {
         const newGamesPlayed = player.gamesPlayed + 1;
         const { error: gamesPlayedError } = await supabase
@@ -532,10 +558,19 @@ function Dashboard({ session }: DashboardProps) {
         c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
       );
 
+      // Bump games_played locally too, both for the waiting-queue removal
+      // and for allPlayers, so the leaderboard reflects the new count
+      // immediately instead of waiting for the next realtime reload.
+      const bumped = new Map(group.map((p) => [p.id, p.gamesPlayed + 1]));
+      const updatedAllPlayers = allPlayersRefSnapshot().map((p) =>
+        bumped.has(p.id) ? { ...p, gamesPlayed: bumped.get(p.id)! } : p
+      );
+
       playersRef.current = updatedPlayers;
       courtsRef.current = updatedCourts;
       setPlayers(updatedPlayers);
       setCourts(updatedCourts);
+      setAllPlayers(updatedAllPlayers);
 
       return { court: openCourt, group };
     });
@@ -560,6 +595,19 @@ function Dashboard({ session }: DashboardProps) {
       pendingRerun.current = false;
       triggerAssignOpenCourts();
     }
+  }
+
+  // Small helper so processNextAssignment can read the latest allPlayers
+  // without adding another ref-sync effect — allPlayers changes far less
+  // often than players/courts, so a plain closure-safe read via functional
+  // state update covers it without extra bookkeeping.
+  function allPlayersRefSnapshot(): Player[] {
+    let snapshot: Player[] = [];
+    setAllPlayers((prev) => {
+      snapshot = prev;
+      return prev;
+    });
+    return snapshot;
   }
 
   useEffect(() => {
@@ -602,12 +650,18 @@ function Dashboard({ session }: DashboardProps) {
     if (nameInput.trim() === '') return;
     const userId = session.user.id;
     const name = nameInput;
+    const level = nameLevel;
     setNameInput('');
 
     await runExclusive(async () => {
       const { data, error } = await supabase
         .from('players')
-        .insert({ name, queue_position: nextQueuePosition(), owner_id: userId })
+        .insert({
+          name,
+          queue_position: nextQueuePosition(),
+          owner_id: userId,
+          skill_level: level,
+        })
         .select()
         .single();
 
@@ -621,10 +675,12 @@ function Dashboard({ session }: DashboardProps) {
         name: data.name,
         partnerId: data.partner_id,
         gamesPlayed: data.games_played ?? 0,
+        skillLevel: (data.skill_level as SkillLevel) ?? 'beginner',
       };
       const updated = [...playersRef.current, newPlayer];
       playersRef.current = updated;
       setPlayers(updated);
+      setAllPlayers((prev) => [...prev, newPlayer]);
     });
   }
 
@@ -644,6 +700,7 @@ function Dashboard({ session }: DashboardProps) {
 
     if (names.length === 0) return;
 
+    const level = batchLevel;
     setBatchInput('');
     setShowBatchModal(false);
 
@@ -652,6 +709,7 @@ function Dashboard({ session }: DashboardProps) {
         name,
         queue_position: nextQueuePosition(),
         owner_id: userId,
+        skill_level: level,
       }));
 
       const { data, error } = await supabase
@@ -669,11 +727,13 @@ function Dashboard({ session }: DashboardProps) {
         name: p.name,
         partnerId: p.partner_id,
         gamesPlayed: p.games_played ?? 0,
+        skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
       }));
 
       const updated = [...playersRef.current, ...newPlayers];
       playersRef.current = updated;
       setPlayers(updated);
+      setAllPlayers((prev) => [...prev, ...newPlayers]);
     });
   }
 
@@ -702,6 +762,7 @@ function Dashboard({ session }: DashboardProps) {
 
       playersRef.current = updated;
       setPlayers(updated);
+      setAllPlayers((prev) => prev.filter((p) => p.id !== id));
     });
   }
 
@@ -921,6 +982,11 @@ function Dashboard({ session }: DashboardProps) {
     unit.some((p) => p.name.toLowerCase().includes(searchTerm.trim().toLowerCase()))
   );
 
+  const leaderboard = [...allPlayers]
+    .filter((p) => p.gamesPlayed > 0)
+    .sort((a, b) => b.gamesPlayed - a.gamesPlayed)
+    .slice(0, LEADERBOARD_SIZE);
+
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
       <div className="fixed inset-0 -z-10 overflow-hidden">
@@ -993,6 +1059,17 @@ function Dashboard({ session }: DashboardProps) {
                 placeholder="Player name"
                 className="bg-white/95 border-0 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white w-full sm:w-36"
               />
+              <select
+                value={nameLevel}
+                onChange={(e) => setNameLevel(e.target.value as SkillLevel)}
+                className="bg-white/95 border-0 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white"
+              >
+                {SKILL_LEVELS.map((level) => (
+                  <option key={level} value={level}>
+                    {level.charAt(0).toUpperCase() + level.slice(1)}
+                  </option>
+                ))}
+              </select>
               <button
                 onClick={handleAddPlayer}
                 className="whitespace-nowrap bg-white text-green-700 hover:bg-green-50 font-semibold text-sm px-4 py-2 rounded-lg transition-colors shadow-sm"
@@ -1076,21 +1153,51 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         </div>
 
-        <div>
-          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
-          <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
-            {courts.map((court) => (
-              <CourtCard
-                key={court.id}
-                court={court}
-                gameLengthMinutes={GAME_LENGTH_MINUTES}
-                warmupMinutes={WARMUP_MINUTES}
-                overtimeMinutes={OVERTIME_MINUTES}
-                timeBased={timeBased}
-                onEndGame={handleEndGame}
-                onAnnounce={handleAnnounceCourt}
-              />
-            ))}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
+              {courts.map((court) => (
+                <CourtCard
+                  key={court.id}
+                  court={court}
+                  gameLengthMinutes={GAME_LENGTH_MINUTES}
+                  warmupMinutes={WARMUP_MINUTES}
+                  overtimeMinutes={OVERTIME_MINUTES}
+                  timeBased={timeBased}
+                  onEndGame={handleEndGame}
+                  onAnnounce={handleAnnounceCourt}
+                />
+              ))}
+            </div>
+          </div>
+
+          {/* Leaderboard */}
+          <div>
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
+              🏆 Leaderboard
+            </h2>
+            <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
+              {leaderboard.length === 0 ? (
+                <p className="text-gray-300 text-sm">No games played yet</p>
+              ) : (
+                <ul className="space-y-2">
+                  {leaderboard.map((player, i) => (
+                    <li
+                      key={player.id}
+                      className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-xs font-bold text-gray-400 w-4 shrink-0">{i + 1}</span>
+                        <SkillBadge level={player.skillLevel} />
+                        <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                      </div>
+                      <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </div>
         </div>
 
@@ -1127,12 +1234,15 @@ function Dashboard({ session }: DashboardProps) {
                     {stack.map((player, i) => (
                       <li
                         key={player.id}
-                        className={`text-sm font-medium truncate rounded-md px-2 py-1 flex items-center gap-1 ${
+                        className={`text-sm font-medium truncate rounded-md px-2 py-1 flex items-center gap-1.5 ${
                           stackIndex === 0 ? 'bg-white/15' : 'bg-gray-50'
                         }`}
                       >
                         <span>{i + 1}. {player.name}</span>
                         {player.partnerId !== null && <span className="text-xs">🔗</span>}
+                        <span className="ml-auto flex items-center gap-1">
+                          {stackIndex !== 0 && <SkillBadge level={player.skillLevel} />}
+                        </span>
                       </li>
                     ))}
                     {Array.from({ length: 4 - stack.length }).map((_, i) => (
@@ -1163,9 +1273,25 @@ function Dashboard({ session }: DashboardProps) {
               onChange={(e) => setBatchInput(e.target.value)}
               placeholder="e.g. Dave, Sarah, Carlos, Elena"
               rows={4}
-              className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 resize-none"
+              className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 resize-none mb-3"
               autoFocus
             />
+            <div>
+              <label className="block text-xs font-semibold text-gray-600 mb-1">
+                Skill level for all of these players
+              </label>
+              <select
+                value={batchLevel}
+                onChange={(e) => setBatchLevel(e.target.value as SkillLevel)}
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+              >
+                {SKILL_LEVELS.map((level) => (
+                  <option key={level} value={level}>
+                    {level.charAt(0).toUpperCase() + level.slice(1)}
+                  </option>
+                ))}
+              </select>
+            </div>
             <div className="flex justify-end gap-2 mt-4">
               <button
                 onClick={() => {
@@ -1271,8 +1397,14 @@ function Dashboard({ session }: DashboardProps) {
                           <span>Paired</span>
                         </div>
                         <div className="flex items-center justify-between mb-1">
-                          <span className="text-sm font-medium text-gray-800 truncate">{unit[0].name}</span>
-                          <span className="text-sm font-medium text-gray-800 truncate">{unit[1].name}</span>
+                          <span className="flex items-center gap-1.5 text-sm font-medium text-gray-800 truncate">
+                            <SkillBadge level={unit[0].skillLevel} />
+                            {unit[0].name}
+                          </span>
+                          <span className="flex items-center gap-1.5 text-sm font-medium text-gray-800 truncate">
+                            <SkillBadge level={unit[1].skillLevel} />
+                            {unit[1].name}
+                          </span>
                         </div>
                         <div className="flex gap-1.5 mt-2">
                           <button
@@ -1306,7 +1438,10 @@ function Dashboard({ session }: DashboardProps) {
                         key={unit[0].id}
                         className="flex items-center justify-between bg-gray-50 hover:bg-gray-100 rounded-lg px-3 py-2 transition-colors"
                       >
-                        <span className="text-gray-800 text-sm font-medium truncate">{unit[0].name}</span>
+                        <span className="flex items-center gap-1.5 text-gray-800 text-sm font-medium truncate">
+                          <SkillBadge level={unit[0].skillLevel} />
+                          {unit[0].name}
+                        </span>
                         <div className="flex gap-1.5 shrink-0 ml-2">
                           {pairingSourceId === unit[0].id ? (
                             <button

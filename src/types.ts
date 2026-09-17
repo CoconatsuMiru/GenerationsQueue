@@ -1,8 +1,11 @@
+export type SkillLevel = 'beginner' | 'intermediate' | 'advanced';
+
 export interface Player {
   id: number;
   name: string;
   partnerId: number | null;
   gamesPlayed: number;
+  skillLevel: SkillLevel;
 }
 
 export interface Court {
@@ -26,6 +29,7 @@ export interface DbPlayer {
   queue_position: number;
   partner_id: number | null;
   games_played: number;
+  skill_level: SkillLevel;
 }
 
 export interface DbCourt {
