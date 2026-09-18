@@ -204,24 +204,29 @@ function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): 
   const totalPoolPlayers = pool.reduce((sum, unit) => sum + unit.length, 0);
   if (totalPoolPlayers < 4) return null;
 
-  const seenLevels: SkillLevel[] = [];
-  for (const unit of pool) {
-    const level = unitSkillLevel(unit);
-    if (level && !seenLevels.includes(level)) seenLevels.push(level);
-  }
+  // Only ever attempt a pure same-level group for whichever level the
+  // FRONT of the queue actually is. Checking every level present in the
+  // pool let a lone under-represented-level player get starved forever:
+  // as long as SOME other level had 4+ players anywhere in the pool,
+  // that level kept winning pass 1, even while the under-represented
+  // player sat at the very front of the whole queue.
+  const frontLevel = unitSkillLevel(pool[0]);
 
-  for (const level of seenLevels) {
-    const sameLevelUnits = pool.filter((u) => unitSkillLevel(u) === level);
+  if (frontLevel) {
+    const sameLevelUnits = pool.filter((u) => unitSkillLevel(u) === frontLevel);
     const sameLevelTotal = sameLevelUnits.reduce((sum, u) => sum + u.length, 0);
-    if (sameLevelTotal < 4) continue;
 
-    const tier = selectFairnessTier(sameLevelUnits);
-    const candidates = generateCandidateGroups(tier);
-    if (candidates.length === 0) continue;
-
-    return pickLowestScored(candidates, groupHistory);
+    if (sameLevelTotal >= 4) {
+      const tier = selectFairnessTier(sameLevelUnits);
+      const candidates = generateCandidateGroups(tier);
+      if (candidates.length > 0) {
+        return pickLowestScored(candidates, groupHistory);
+      }
+    }
   }
 
+  // Fallback: mix levels. Also covers a front unit that's itself a
+  // mixed-level pair (frontLevel === null).
   const tier = selectFairnessTier(pool);
   const candidates = generateCandidateGroups(tier);
   if (candidates.length === 0) return null;
@@ -548,13 +553,21 @@ function Dashboard({ session }: DashboardProps) {
         }
       }
 
-      const assignedIds = new Set(group.map((p) => p.id));
+    // From here on, use players with their INCREMENTED games_played. The
+    // `group` array up to this point still holds the pre-game counts — if
+    // those stale objects were stored on the court, then later returned to
+    // the queue when the game ends, the count would silently reset to
+    // "before this game" every time, which is exactly why games_played
+    // appeared to stop counting after the first game.
+      const incrementedGroup = group.map((p) => ({ ...p, gamesPlayed: p.gamesPlayed + 1 }));
+
+      const assignedIds = new Set(incrementedGroup.map((p) => p.id));
       const updatedPlayers = playersRef.current.filter((p) => !assignedIds.has(p.id));
       const updatedCourts = courtsRef.current.map((c) =>
-        c.id === openCourt.id ? { ...c, players: group, startTime: startTimeMs } : c
+        c.id === openCourt.id ? { ...c, players: incrementedGroup, startTime: startTimeMs } : c
       );
 
-      const bumped = new Map(group.map((p) => [p.id, p.gamesPlayed + 1]));
+      const bumped = new Map(incrementedGroup.map((p) => [p.id, p.gamesPlayed]));
 
       playersRef.current = updatedPlayers;
       courtsRef.current = updatedCourts;
@@ -562,7 +575,7 @@ function Dashboard({ session }: DashboardProps) {
       setCourts(updatedCourts);
       setAllPlayers((prev) => prev.map((p) => (bumped.has(p.id) ? { ...p, gamesPlayed: bumped.get(p.id)! } : p)));
 
-      return { court: openCourt, group };
+      return { court: openCourt, group: incrementedGroup };
     });
 
     if (assignment && voiceEnabled && isSpeechSupported()) {
@@ -892,6 +905,12 @@ function Dashboard({ session }: DashboardProps) {
     const userId = session.user.id;
     const newValue = !isSessionActive;
 
+    // Update local state immediately rather than waiting for the realtime
+    // event to round-trip back — on a slower production connection that
+    // round trip can lag noticeably, which is what made Start Session
+    // look like it needed a manual refresh to actually take effect.
+    setIsSessionActive(newValue);
+
     const { error } = await supabase
       .from('session_state')
       .update({ is_active: newValue })
@@ -899,6 +918,7 @@ function Dashboard({ session }: DashboardProps) {
 
     if (error) {
       console.error('Error updating session state:', error);
+      setIsSessionActive(!newValue); // revert on failure
       return;
     }
   }
