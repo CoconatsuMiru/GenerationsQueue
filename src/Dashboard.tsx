@@ -136,23 +136,83 @@ function selectFairnessTier(pool: Player[][]): Player[][] {
   return tier;
 }
 
-function generateCandidateGroups(tierUnits: Player[][]): Player[][] {
-  const candidates: Player[][] = [];
-  const seen = new Set<string>();
-  const maxStarts = Math.min(tierUnits.length, 5);
+// Beginners and Advanced can't be grouped together; Intermediate is
+// compatible with everyone, including same-level. This is only checked
+// when filling a group — the anchor player (see below) is always kept
+// regardless of what it's compatible with.
+function skillCompatible(a: SkillLevel, b: SkillLevel): boolean {
+  if (a === 'intermediate' || b === 'intermediate') return true;
+  return a === b;
+}
 
-  for (let start = 0; start < maxStarts; start++) {
-    const { group } = selectNextGroup(tierUnits.slice(start), 4);
-    if (group.length < 4) continue;
+function unitCompatibleWithGroup(unit: Player[], group: Player[]): boolean {
+  return unit.every((u) => group.every((g) => skillCompatible(u.skillLevel, g.skillLevel)));
+}
 
-    const key = group.map((p) => p.id).sort((a, b) => a - b).join(',');
-    if (seen.has(key)) continue;
+// Builds one candidate group that ALWAYS includes `anchor` — the
+// highest-priority (fewest games played) unit in the tier — then fills
+// the remaining slots from `otherUnits`, starting at `startOffset` for
+// diversity across candidates. When allowIncompatible is false, a unit is
+// only added if every one of its players is skill-compatible with
+// everyone already in the group; this is what enforces
+// Beginner-can't-mix-with-Advanced. Returns null if 4 players couldn't be
+// assembled under the current constraints.
+function buildGroupWithAnchor(
+  anchor: Player[],
+  otherUnits: Player[][],
+  startOffset: number,
+  allowIncompatible: boolean
+): Player[] | null {
+  const group: Player[] = [...anchor];
+  const rotated = [...otherUnits.slice(startOffset), ...otherUnits.slice(0, startOffset)];
 
-    seen.add(key);
-    candidates.push(group);
+  for (const unit of rotated) {
+    if (group.length >= 4) break;
+    if (unit.length > 4 - group.length) continue;
+    if (!allowIncompatible && !unitCompatibleWithGroup(unit, group)) continue;
+    group.push(...unit);
   }
 
-  return candidates;
+  return group.length === 4 ? group : null;
+}
+
+// Generates a handful of valid 4-player groupings for pairing-diversity
+// scoring, with tierUnits[0] (the top fairness priority) mandatory in
+// every single one — it can never be excluded just because a different
+// combination happens to score better on repeat-pairing history. Tries
+// skill-compatible fills first across a few starting offsets; only if
+// NONE of those produce a full group of 4 does it retry allowing
+// incompatible pairings (e.g. Beginner + Advanced), so nobody is left
+// waiting indefinitely purely because their skill level is scarce.
+function generateCandidateGroups(tierUnits: Player[][]): Player[][] {
+  if (tierUnits.length === 0) return [];
+
+  const anchor = tierUnits[0];
+  const otherUnits = tierUnits.slice(1);
+  const maxStarts = Math.max(Math.min(otherUnits.length, 5), 1);
+
+  function collect(allowIncompatible: boolean): Player[][] {
+    const candidates: Player[][] = [];
+    const seen = new Set<string>();
+
+    for (let start = 0; start < maxStarts; start++) {
+      const group = buildGroupWithAnchor(anchor, otherUnits, start, allowIncompatible);
+      if (!group) continue;
+
+      const key = group.map((p) => p.id).sort((a, b) => a - b).join(',');
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      candidates.push(group);
+    }
+
+    return candidates;
+  }
+
+  const compatible = collect(false);
+  if (compatible.length > 0) return compatible;
+
+  return collect(true);
 }
 
 function scoreGroup(group: Player[], groupHistory: Map<string, number>): number {
