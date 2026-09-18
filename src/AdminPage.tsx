@@ -30,7 +30,6 @@ function AdminPage() {
   useEffect(() => {
     loadSettings();
     loadCourts();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedVoiceURI(getSavedVoiceURI());
     getAvailableVoices().then(setVoices);
   }, []);
@@ -396,17 +395,20 @@ function AdminPage() {
               />
             </div>
           </div>
+        </div>
 
-          <div className="flex items-center gap-3 mt-6">
-            <button
-              onClick={handleSaveSettings}
-              disabled={isSaving}
-              className="bg-green-600 hover:bg-green-700 disabled:opacity-60 text-white font-semibold text-sm px-5 py-2.5 rounded-lg transition-colors"
-            >
-              {isSaving ? 'Saving...' : 'Save Settings'}
-            </button>
-            {saveMessage && <span className="text-sm text-green-600 font-medium">{saveMessage}</span>}
-          </div>
+        {/* Apply settings — global save for everything above */}
+        <div>
+          <button
+            onClick={handleSaveSettings}
+            disabled={isSaving}
+            className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-60 text-white font-bold text-sm px-5 py-3.5 rounded-xl transition-colors shadow-md"
+          >
+            {isSaving ? 'Applying...' : 'Apply Settings'}
+          </button>
+          {saveMessage && (
+            <p className="text-center text-sm text-green-600 font-medium mt-2">{saveMessage}</p>
+          )}
         </div>
 
         {/* Court management */}

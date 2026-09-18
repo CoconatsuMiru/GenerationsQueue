@@ -866,7 +866,7 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
     });
   }
 
-async function handleEndGame(courtId: number) {
+    async function handleEndGame(courtId: number) {
     stopSpeaking();
     announcementCancelled.current = true;
 
