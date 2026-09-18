@@ -14,7 +14,6 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-const FAIRNESS_POOL_TARGET_PLAYERS = 8;
 
 
 interface DashboardProps {
@@ -108,17 +107,6 @@ function pairKey(idA: number, idB: number): string {
   return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
 }
 
-function buildCandidatePool(units: Player[][], targetPlayers: number): Player[][] {
-  const pool: Player[][] = [];
-  let total = 0;
-  for (const unit of units) {
-    if (total >= targetPlayers) break;
-    pool.push(unit);
-    total += unit.length;
-  }
-  return pool;
-}
-
 function unitGamesPlayed(unit: Player[]): number {
   return Math.max(...unit.map((p) => p.gamesPlayed));
 }
@@ -187,47 +175,42 @@ function pickLowestScored(
   return shuffleArray(best)[0].group;
 }
 
-// Chooses which 4 players get the next open court (Fair Queueing mode).
+// Chooses which 4 players get the next open court, guaranteeing a real
+// fairness ordering across the ENTIRE waiting list (not just players near
+// the front of the queue): selectFairnessTier sorts every waiting unit by
+// games played and returns the lowest tier, expanding to include the next
+// tier up only if the lowest one doesn't have 4 players yet. A player who
+// has played fewer games than everyone else is therefore never skipped in
+// favor of someone who's played more, no matter where they sit in the
+// queue — that's what "fair" actually means in this mode.
 //
-// Pass 1 (skill matching): pulls a forward-looking pool from the front of
-// the queue, then tries — in the order skill levels first appear in that
-// pool (so it still leans FIFO) — to fill a court entirely from ONE skill
-// level. Within whichever level has enough players, games-played fairness
-// tiering and repeat-grouping history scoring apply.
-//
-// Pass 2 (fallback): if no single skill level has 4 players available near
-// the front of the queue, mixes levels rather than leaving a court empty.
+// Within that fairness tier, we still try to fill the court from a single
+// skill level first (checked against whichever level appears earliest in
+// the tier), falling back to a mixed-level group only if the tier doesn't
+// have 4 players of one level.
 function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): Player[] | null {
   const units = buildUnits(players);
-  const pool = buildCandidatePool(units, FAIRNESS_POOL_TARGET_PLAYERS);
 
-  const totalPoolPlayers = pool.reduce((sum, unit) => sum + unit.length, 0);
-  if (totalPoolPlayers < 4) return null;
+  const totalWaiting = units.reduce((sum, unit) => sum + unit.length, 0);
+  if (totalWaiting < 4) return null;
 
-  // Only ever attempt a pure same-level group for whichever level the
-  // FRONT of the queue actually is. Checking every level present in the
-  // pool let a lone under-represented-level player get starved forever:
-  // as long as SOME other level had 4+ players anywhere in the pool,
-  // that level kept winning pass 1, even while the under-represented
-  // player sat at the very front of the whole queue.
-  const frontLevel = unitSkillLevel(pool[0]);
+  const tier = selectFairnessTier(units);
+
+  const frontLevel = unitSkillLevel(tier[0]);
 
   if (frontLevel) {
-    const sameLevelUnits = pool.filter((u) => unitSkillLevel(u) === frontLevel);
+    const sameLevelUnits = tier.filter((u) => unitSkillLevel(u) === frontLevel);
     const sameLevelTotal = sameLevelUnits.reduce((sum, u) => sum + u.length, 0);
 
     if (sameLevelTotal >= 4) {
-      const tier = selectFairnessTier(sameLevelUnits);
-      const candidates = generateCandidateGroups(tier);
+      const candidates = generateCandidateGroups(sameLevelUnits);
       if (candidates.length > 0) {
         return pickLowestScored(candidates, groupHistory);
       }
     }
   }
 
-  // Fallback: mix levels. Also covers a front unit that's itself a
-  // mixed-level pair (frontLevel === null).
-  const tier = selectFairnessTier(pool);
+  // Fallback: mix levels within the same fairness tier.
   const candidates = generateCandidateGroups(tier);
   if (candidates.length === 0) return null;
 
