@@ -30,6 +30,7 @@ function AdminPage() {
   useEffect(() => {
     loadSettings();
     loadCourts();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedVoiceURI(getSavedVoiceURI());
     getAvailableVoices().then(setVoices);
   }, []);
