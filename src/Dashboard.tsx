@@ -5,7 +5,7 @@ import type { Player, Court, SkillLevel } from './types';
 import { SkillBadge, SKILL_LEVELS } from './skillLevels';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
-import { speak, isSpeechSupported, primeSpeechOnFirstInteraction } from './speech';
+import { speak, isSpeechSupported, primeSpeechOnFirstInteraction, stopSpeaking } from './speech';
 import type { Session } from '@supabase/supabase-js';
 
 const GAME_LENGTH_MINUTES = 15;
@@ -311,6 +311,7 @@ function Dashboard({ session }: DashboardProps) {
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const announcedAssignments = useRef<Set<string>>(new Set());
   const announcedOvertime = useRef<Set<string>>(new Set());
+  const announcementCancelled = useRef(false);
 
   const isAssigning = useRef(false);
   const autoEndingCourts = useRef<Set<number>>(new Set());
@@ -621,13 +622,21 @@ function Dashboard({ session }: DashboardProps) {
       return { court: openCourt, group: incrementedGroup };
     });
 
-    if (assignment && voiceEnabled && isSpeechSupported()) {
+if (assignment && voiceEnabled && isSpeechSupported()) {
+      announcementCancelled.current = false;
       const names = assignment.group.map((p) => p.name).join(', ');
       const announcement = `${assignment.court.name}. ${names}.`;
+
       await speak(announcement);
-      await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
-      await speak(announcement);
-      await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
+      if (!announcementCancelled.current) {
+        await new Promise((resolve) => setTimeout(resolve, FIRST_CALL_REPEAT_PAUSE_MS));
+      }
+      if (!announcementCancelled.current) {
+        await speak(announcement);
+      }
+      if (!announcementCancelled.current) {
+        await new Promise((resolve) => setTimeout(resolve, ANNOUNCE_PAUSE_MS));
+      }
     }
 
     if (assignment) {
@@ -857,7 +866,10 @@ function Dashboard({ session }: DashboardProps) {
     });
   }
 
-  async function handleEndGame(courtId: number) {
+async function handleEndGame(courtId: number) {
+    stopSpeaking();
+    announcementCancelled.current = true;
+
     await runExclusive(async () => {
       const court = courtsRef.current.find((c) => c.id === courtId);
       if (!court) return;

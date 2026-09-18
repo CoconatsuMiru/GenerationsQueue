@@ -89,6 +89,16 @@ export function speak(text: string): Promise<void> {
   });
 }
 
+// Immediately stops whatever is currently being spoken. Calling
+// window.speechSynthesis.cancel() interrupts the in-progress utterance,
+// which fires its onerror handler — and since speak()'s promise already
+// resolves on both onend and onerror, any code awaiting a speak() call
+// unblocks right away instead of hanging.
+export function stopSpeaking() {
+  if (typeof window === 'undefined' || !window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+}
+
 let primed = false;
 
 // iOS Safari only allows the speech engine to start if the very first
