@@ -30,6 +30,7 @@ function AdminPage() {
   useEffect(() => {
     loadSettings();
     loadCourts();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedVoiceURI(getSavedVoiceURI());
     getAvailableVoices().then(setVoices);
   }, []);
@@ -102,7 +103,7 @@ function AdminPage() {
       mapped.map((c) => ({
         ...c,
         players: occupied.has(c.id)
-          ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const, wins: 0 }]
+          ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const, wins: 0, losses: 0 }]
           : [],
       }))
     );

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './App.css';
-import type { Player, Court, SkillLevel, MatchRecord } from './types';
+import type { Player, Court, SkillLevel } from './types';
 import { SkillBadge, SKILL_LEVELS } from './skillLevels';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
@@ -128,6 +128,23 @@ function nextQueuePosition(): number {
 
 function pairKey(idA: number, idB: number): string {
   return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
+}
+
+// Ranking order for the Leaderboard: players who have played come first,
+// sorted by win percentage, then total wins, then name. Players with a
+// 0-0 record sit at the bottom.
+function compareByRecord(a: Player, b: Player): number {
+  const totalA = a.wins + a.losses;
+  const totalB = b.wins + b.losses;
+
+  if ((totalA === 0) !== (totalB === 0)) return totalA === 0 ? 1 : -1;
+
+  const pctA = totalA > 0 ? a.wins / totalA : 0;
+  const pctB = totalB > 0 ? b.wins / totalB : 0;
+
+  if (pctB !== pctA) return pctB - pctA;
+  if (b.wins !== a.wins) return b.wins - a.wins;
+  return a.name.localeCompare(b.name);
 }
 
 function unitGamesPlayed(unit: Player[]): number {
@@ -304,7 +321,7 @@ function Dashboard({ session }: DashboardProps) {
   const navigate = useNavigate();
 
   const [players, setPlayers] = useState<Player[]>([]);
-  const [allPlayers, setAllPlayers] = useState<Player[]>([]); // full roster (waiting + playing), for the leaderboard
+  const [allPlayers, setAllPlayers] = useState<Player[]>([]); // full roster (waiting + playing), for the leaderboards
   const [nameInput, setNameInput] = useState('');
   const [nameLevel, setNameLevel] = useState<SkillLevel>('beginner');
 
@@ -320,11 +337,11 @@ function Dashboard({ session }: DashboardProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [pairingSourceId, setPairingSourceId] = useState<number | null>(null);
 
+  // Games Played dropdown
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [leaderboardSearch, setLeaderboardSearch] = useState('');
 
-  const [matches, setMatches] = useState<MatchRecord[]>([]);
-  const [showMatches, setShowMatches] = useState(false);
+  // Leaderboard (win-loss ranking) dropdown
   const [showWinLeaderboard, setShowWinLeaderboard] = useState(false);
   const [winLeaderboardSearch, setWinLeaderboardSearch] = useState('');
 
@@ -472,6 +489,7 @@ function Dashboard({ session }: DashboardProps) {
       gamesPlayed: p.games_played ?? 0,
       skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
       wins: p.wins ?? 0,
+      losses: p.losses ?? 0,
     }));
 
     const playingIds = new Set(
@@ -493,25 +511,6 @@ function Dashboard({ session }: DashboardProps) {
       historyMap.set(pairKey(row.player_a_id, row.player_b_id), row.count);
     });
     groupHistoryRef.current = historyMap;
-
-    const { data: dbMatches, error: matchesError } = await supabase
-      .from('matches')
-      .select('*')
-      .eq('owner_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(20);
-
-    if (matchesError) console.error('Error loading matches:', matchesError);
-
-    const mappedMatches: MatchRecord[] = (dbMatches ?? []).map((m) => ({
-      id: m.id,
-      courtName: m.court_name,
-      teamANames: m.team_a_names,
-      teamBNames: m.team_b_names,
-      winnerTeam: m.winner_team,
-      createdAt: m.created_at,
-    }));
-    setMatches(mappedMatches);
 
     setPlayers(waitingPlayers);
     setAllPlayers(allPlayersList);
@@ -556,11 +555,6 @@ function Dashboard({ session }: DashboardProps) {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'venue_settings', filter: `owner_id=eq.${userId}` },
-        scheduleReload
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'matches', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
       .subscribe();
@@ -778,6 +772,7 @@ function Dashboard({ session }: DashboardProps) {
         gamesPlayed: data.games_played ?? 0,
         skillLevel: (data.skill_level as SkillLevel) ?? 'beginner',
         wins: data.wins ?? 0,
+        losses: data.losses ?? 0,
       };
       const updated = [...playersRef.current, newPlayer];
       playersRef.current = updated;
@@ -831,6 +826,7 @@ function Dashboard({ session }: DashboardProps) {
         gamesPlayed: p.games_played ?? 0,
         skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
         wins: p.wins ?? 0,
+        losses: p.losses ?? 0,
       }));
 
       const updated = [...playersRef.current, ...newPlayers];
@@ -982,15 +978,16 @@ function Dashboard({ session }: DashboardProps) {
   }
 
   // Ends a game with no score recorded — same clearing/backfill behavior
-  // as always, just no win/match bookkeeping attached.
+  // as always, just no win/loss bookkeeping attached.
   async function handleEndGame(courtId: number) {
     stopSpeaking();
     announcementCancelled.current = true;
     await runExclusive(() => performCourtClear(courtId));
   }
 
-  // Records which side won: logs the match, credits both winning players
-  // a win, then clears/requeues the court exactly like handleEndGame.
+  // Records which side won: logs the match, credits a win to both winning
+  // players and a loss to both losing players, then clears/requeues the
+  // court exactly like handleEndGame.
   async function handleRecordWin(courtId: number, winningSide: 'a' | 'b') {
     stopSpeaking();
     announcementCancelled.current = true;
@@ -1002,6 +999,7 @@ function Dashboard({ session }: DashboardProps) {
       const teamA = court.players.slice(0, 2);
       const teamB = court.players.slice(2, 4);
       const winners = winningSide === 'a' ? teamA : teamB;
+      const losers = winningSide === 'a' ? teamB : teamA;
 
       const { error: matchError } = await supabase.from('matches').insert({
         owner_id: session.user.id,
@@ -1021,13 +1019,27 @@ function Dashboard({ session }: DashboardProps) {
         if (winError) console.error('Error updating wins:', winError);
       }
 
+      for (const player of losers) {
+        const { error: lossError } = await supabase
+          .from('players')
+          .update({ losses: player.losses + 1 })
+          .eq('id', player.id);
+        if (lossError) console.error('Error updating losses:', lossError);
+      }
+
       const winnerIds = new Set(winners.map((p) => p.id));
+      const loserIds = new Set(losers.map((p) => p.id));
+
+      const applyResult = (p: Player): Player => {
+        if (winnerIds.has(p.id)) return { ...p, wins: p.wins + 1 };
+        if (loserIds.has(p.id)) return { ...p, losses: p.losses + 1 };
+        return p;
+      };
+
       courtsRef.current = courtsRef.current.map((c) =>
-        c.id === courtId
-          ? { ...c, players: c.players.map((p) => (winnerIds.has(p.id) ? { ...p, wins: p.wins + 1 } : p)) }
-          : c
+        c.id === courtId ? { ...c, players: c.players.map(applyResult) } : c
       );
-      setAllPlayers((prev) => prev.map((p) => (winnerIds.has(p.id) ? { ...p, wins: p.wins + 1 } : p)));
+      setAllPlayers((prev) => prev.map(applyResult));
 
       await performCourtClear(courtId);
     });
@@ -1173,9 +1185,14 @@ function Dashboard({ session }: DashboardProps) {
     .filter((p) => p.name.toLowerCase().includes(leaderboardSearch.trim().toLowerCase()))
     .sort((a, b) => b.gamesPlayed - a.gamesPlayed);
 
+  // Rank is computed against the whole roster first, so a player keeps
+  // their true rank number even while the search box is filtering the list.
   const winLeaderboardResults = [...allPlayers]
-    .filter((p) => p.name.toLowerCase().includes(winLeaderboardSearch.trim().toLowerCase()))
-    .sort((a, b) => b.wins - a.wins);
+    .sort(compareByRecord)
+    .map((player, index) => ({ player, rank: index + 1 }))
+    .filter(({ player }) =>
+      player.name.toLowerCase().includes(winLeaderboardSearch.trim().toLowerCase())
+    );
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -1343,88 +1360,23 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
-            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
-              {courts.map((court) => (
-                <CourtCard
-                  key={court.id}
-                  court={court}
-                  gameLengthMinutes={gameMinutes}
-                  warmupMinutes={warmupMinutes}
-                  overtimeMinutes={overtimeMinutes}
-                  timeBased={timeBased}
-                  onEndGame={handleEndGame}
-                  onAnnounce={handleAnnounceCourt}
-                  onRecordWin={handleRecordWin}
-                />
-              ))}
-            </div>
-          </div>
-
-          {/* Games Played lookup */}
-          <div>
-            <button
-              onClick={() => setShowLeaderboard((v) => !v)}
-              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
-            >
-              <span>🏆 Games Played</span>
-              <svg
-                className={`w-4 h-4 transition-transform ${showLeaderboard ? 'rotate-180' : ''}`}
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-
-            {showLeaderboard && (
-              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
-                <div className="relative mb-3">
-                  <svg
-                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <circle cx="11" cy="11" r="7" />
-                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
-                  </svg>
-                  <input
-                    type="text"
-                    value={leaderboardSearch}
-                    onChange={(e) => setLeaderboardSearch(e.target.value)}
-                    placeholder="Search players..."
-                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
-                  />
-                </div>
-
-                {leaderboardResults.length === 0 ? (
-                  <p className="text-gray-300 text-sm">
-                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
-                  </p>
-                ) : (
-                  <ul className="space-y-2 max-h-64 overflow-y-auto">
-                    {leaderboardResults.map((player) => (
-                      <li
-                        key={player.id}
-                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <SkillBadge level={player.skillLevel} />
-                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
-                        </div>
-                        <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
+        {/* Courts — full width, nothing beside them */}
+        <div>
+          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Courts</h2>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(340px,100%),1fr))] gap-4">
+            {courts.map((court) => (
+              <CourtCard
+                key={court.id}
+                court={court}
+                gameLengthMinutes={gameMinutes}
+                warmupMinutes={warmupMinutes}
+                overtimeMinutes={overtimeMinutes}
+                timeBased={timeBased}
+                onEndGame={handleEndGame}
+                onAnnounce={handleAnnounceCourt}
+                onRecordWin={handleRecordWin}
+              />
+            ))}
           </div>
         </div>
 
@@ -1489,16 +1441,17 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
-          {/* Matches Played */}
+        {/* Two dropdowns: Games Played + Leaderboard */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8 items-start">
+          {/* Games Played */}
           <div>
             <button
-              onClick={() => setShowMatches((v) => !v)}
+              onClick={() => setShowLeaderboard((v) => !v)}
               className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
             >
-              <span>📋 Matches Played</span>
+              <span>📊 Games Played</span>
               <svg
-                className={`w-4 h-4 transition-transform ${showMatches ? 'rotate-180' : ''}`}
+                className={`w-4 h-4 transition-transform ${showLeaderboard ? 'rotate-180' : ''}`}
                 fill="none"
                 viewBox="0 0 24 24"
                 stroke="currentColor"
@@ -1507,24 +1460,45 @@ function Dashboard({ session }: DashboardProps) {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
               </svg>
             </button>
-            {showMatches && (
+
+            {showLeaderboard && (
               <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
-                {matches.length === 0 ? (
-                  <p className="text-gray-300 text-sm">No matches recorded yet</p>
+                <div className="relative mb-3">
+                  <svg
+                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <circle cx="11" cy="11" r="7" />
+                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
+                  </svg>
+                  <input
+                    type="text"
+                    value={leaderboardSearch}
+                    onChange={(e) => setLeaderboardSearch(e.target.value)}
+                    placeholder="Search players..."
+                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                  />
+                </div>
+
+                {leaderboardResults.length === 0 ? (
+                  <p className="text-gray-300 text-sm">
+                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
+                  </p>
                 ) : (
-                  <ul className="space-y-2 max-h-72 overflow-y-auto">
-                    {matches.map((m) => (
-                      <li key={m.id} className="bg-gray-50 rounded-lg px-3 py-2 text-sm">
-                        <p className="text-xs font-bold text-gray-400 mb-1">{m.courtName}</p>
-                        <p className="flex items-center gap-1.5 flex-wrap">
-                          <span className={m.winnerTeam === 'a' ? 'font-bold text-green-600' : 'text-gray-500'}>
-                            {m.teamANames.join(' & ')}
-                          </span>
-                          <span className="text-gray-300">vs</span>
-                          <span className={m.winnerTeam === 'b' ? 'font-bold text-green-600' : 'text-gray-500'}>
-                            {m.teamBNames.join(' & ')}
-                          </span>
-                        </p>
+                  <ul className="space-y-2 max-h-64 overflow-y-auto">
+                    {leaderboardResults.map((player) => (
+                      <li
+                        key={player.id}
+                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <SkillBadge level={player.skillLevel} />
+                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                        </div>
+                        <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
                       </li>
                     ))}
                   </ul>
@@ -1533,7 +1507,7 @@ function Dashboard({ session }: DashboardProps) {
             )}
           </div>
 
-          {/* Leaderboard by wins */}
+          {/* Leaderboard — win-loss ranking */}
           <div>
             <button
               onClick={() => setShowWinLeaderboard((v) => !v)}
@@ -1550,6 +1524,7 @@ function Dashboard({ session }: DashboardProps) {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
               </svg>
             </button>
+
             {showWinLeaderboard && (
               <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
                 <div className="relative mb-3">
@@ -1578,19 +1553,31 @@ function Dashboard({ session }: DashboardProps) {
                   </p>
                 ) : (
                   <ul className="space-y-2 max-h-64 overflow-y-auto">
-                    {winLeaderboardResults.map((player, i) => (
-                      <li
-                        key={player.id}
-                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="text-xs font-bold text-gray-400 w-4 shrink-0">{i + 1}</span>
-                          <SkillBadge level={player.skillLevel} />
-                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
-                        </div>
-                        <span className="text-sm font-bold text-green-600 shrink-0">{player.wins}</span>
-                      </li>
-                    ))}
+                    {winLeaderboardResults.map(({ player, rank }) => {
+                      const total = player.wins + player.losses;
+                      const pct = total > 0 ? Math.round((player.wins / total) * 100) : null;
+
+                      return (
+                        <li
+                          key={player.id}
+                          className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-xs font-bold text-gray-400 w-5 shrink-0">{rank}</span>
+                            <SkillBadge level={player.skillLevel} />
+                            <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                          </div>
+                          <div className="flex items-baseline gap-2 shrink-0">
+                            <span className="text-sm font-bold text-green-600 tabular-nums">
+                              {player.wins}-{player.losses}
+                            </span>
+                            <span className="text-xs text-gray-400 tabular-nums w-9 text-right">
+                              {pct === null ? '—' : `${pct}%`}
+                            </span>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>
