@@ -6,6 +6,7 @@ export interface Player {
   partnerId: number | null;
   gamesPlayed: number;
   skillLevel: SkillLevel;
+  wins: number;
 }
 
 export interface Court {
@@ -23,6 +24,16 @@ export interface VenueSettings {
   queueMode: 'fifo' | 'fair';
 }
 
+// One finished match, as shown in the "Matches Played" list.
+export interface MatchRecord {
+  id: number;
+  courtName: string;
+  teamANames: string[];
+  teamBNames: string[];
+  winnerTeam: 'a' | 'b';
+  createdAt: string;
+}
+
 // Shapes matching the actual Supabase table rows
 export interface DbPlayer {
   id: number;
@@ -31,6 +42,7 @@ export interface DbPlayer {
   partner_id: number | null;
   games_played: number;
   skill_level: SkillLevel;
+  wins: number;
 }
 
 export interface DbCourt {
@@ -59,4 +71,15 @@ export interface DbGroupHistory {
   player_a_id: number;
   player_b_id: number;
   count: number;
+}
+
+export interface DbMatch {
+  id: number;
+  owner_id: string;
+  court_id: number;
+  court_name: string;
+  team_a_names: string[];
+  team_b_names: string[];
+  winner_team: 'a' | 'b';
+  created_at: string;
 }

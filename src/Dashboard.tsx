@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './App.css';
-import type { Player, Court, SkillLevel } from './types';
+import type { Player, Court, SkillLevel, MatchRecord } from './types';
 import { SkillBadge, SKILL_LEVELS } from './skillLevels';
 import { supabase } from './supabaseClient';
 import CourtCard from './CourtCard';
@@ -84,6 +84,29 @@ function buildQueueGroups(units: Player[][], size: number, maxGroups: number): P
   }
 
   return groups;
+}
+
+// Splits a chosen group of 4 into Team A (left side) and Team B (right
+// side), always keeping a paired duo together on the same side. Works by
+// re-running buildUnits on just these 4 players — since partners are
+// always assigned as a unit in the first place, this reliably recovers
+// which 2 are a pair. Returns the group reordered as
+// [teamA0, teamA1, teamB0, teamB1]; CourtCard slices this array in half
+// to render each side.
+function orderGroupIntoTeams(group: Player[]): Player[] {
+  const units = buildUnits(group);
+  const teamA: Player[] = [];
+  const teamB: Player[] = [];
+
+  for (const unit of units) {
+    if (unit.length <= 2 - teamA.length) {
+      teamA.push(...unit);
+    } else {
+      teamB.push(...unit);
+    }
+  }
+
+  return [...teamA, ...teamB];
 }
 
 function shuffleArray<T>(array: T[]): T[] {
@@ -295,10 +318,15 @@ function Dashboard({ session }: DashboardProps) {
 
   const [showQueueSidebar, setShowQueueSidebar] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [pairingSourceId, setPairingSourceId] = useState<number | null>(null); 
-  
+  const [pairingSourceId, setPairingSourceId] = useState<number | null>(null);
+
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [leaderboardSearch, setLeaderboardSearch] = useState('');
+
+  const [matches, setMatches] = useState<MatchRecord[]>([]);
+  const [showMatches, setShowMatches] = useState(false);
+  const [showWinLeaderboard, setShowWinLeaderboard] = useState(false);
+  const [winLeaderboardSearch, setWinLeaderboardSearch] = useState('');
 
   const [isSessionActive, setIsSessionActive] = useState(false);
 
@@ -443,6 +471,7 @@ function Dashboard({ session }: DashboardProps) {
       partnerId: p.partner_id,
       gamesPlayed: p.games_played ?? 0,
       skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
+      wins: p.wins ?? 0,
     }));
 
     const playingIds = new Set(
@@ -453,7 +482,9 @@ function Dashboard({ session }: DashboardProps) {
     const mappedCourts: Court[] = (dbCourts ?? []).map((c) => ({
       id: c.id,
       name: c.name,
-      players: allPlayersList.filter((p) => (c.player_ids ?? []).includes(p.id)),
+      players: (c.player_ids ?? [])
+        .map((id: number) => allPlayersList.find((p) => p.id === id))
+        .filter((p: Player | undefined): p is Player => p !== undefined),
       startTime: c.start_time ? new Date(c.start_time).getTime() : null,
     }));
 
@@ -462,6 +493,25 @@ function Dashboard({ session }: DashboardProps) {
       historyMap.set(pairKey(row.player_a_id, row.player_b_id), row.count);
     });
     groupHistoryRef.current = historyMap;
+
+    const { data: dbMatches, error: matchesError } = await supabase
+      .from('matches')
+      .select('*')
+      .eq('owner_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (matchesError) console.error('Error loading matches:', matchesError);
+
+    const mappedMatches: MatchRecord[] = (dbMatches ?? []).map((m) => ({
+      id: m.id,
+      courtName: m.court_name,
+      teamANames: m.team_a_names,
+      teamBNames: m.team_b_names,
+      winnerTeam: m.winner_team,
+      createdAt: m.created_at,
+    }));
+    setMatches(mappedMatches);
 
     setPlayers(waitingPlayers);
     setAllPlayers(allPlayersList);
@@ -508,6 +558,11 @@ function Dashboard({ session }: DashboardProps) {
         { event: '*', schema: 'public', table: 'venue_settings', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'matches', filter: `owner_id=eq.${userId}` },
+        scheduleReload
+      )
       .subscribe();
 
     return () => {
@@ -546,12 +601,16 @@ function Dashboard({ session }: DashboardProps) {
           : chooseFairGroup(playersRef.current, groupHistoryRef.current);
       if (!group) return null;
 
+      // Reorder into [teamA0, teamA1, teamB0, teamB1] so partners always
+      // share a side. This order is what gets stored in player_ids.
+      const orderedGroup = orderGroupIntoTeams(group);
+
       const startTimeIso = new Date().toISOString();
 
       const { error } = await supabase
         .from('courts')
         .update({
-          player_ids: group.map((p) => p.id),
+          player_ids: orderedGroup.map((p) => p.id),
           start_time: startTimeIso,
         })
         .eq('id', openCourt.id);
@@ -564,7 +623,7 @@ function Dashboard({ session }: DashboardProps) {
       const startTimeMs = new Date(startTimeIso).getTime();
       announcedAssignments.current.add(`${openCourt.id}-${startTimeMs}`);
 
-      for (const player of group) {
+      for (const player of orderedGroup) {
         const newGamesPlayed = player.gamesPlayed + 1;
         const { error: gamesPlayedError } = await supabase
           .from('players')
@@ -573,10 +632,10 @@ function Dashboard({ session }: DashboardProps) {
         if (gamesPlayedError) console.error('Error updating games_played:', gamesPlayedError);
       }
 
-      for (let i = 0; i < group.length; i++) {
-        for (let j = i + 1; j < group.length; j++) {
-          const idA = group[i].id;
-          const idB = group[j].id;
+      for (let i = 0; i < orderedGroup.length; i++) {
+        for (let j = i + 1; j < orderedGroup.length; j++) {
+          const idA = orderedGroup[i].id;
+          const idB = orderedGroup[j].id;
           const key = pairKey(idA, idB);
           const newCount = (groupHistoryRef.current.get(key) ?? 0) + 1;
           const [playerAId, playerBId] = idA < idB ? [idA, idB] : [idB, idA];
@@ -597,13 +656,13 @@ function Dashboard({ session }: DashboardProps) {
         }
       }
 
-    // From here on, use players with their INCREMENTED games_played. The
-    // `group` array up to this point still holds the pre-game counts — if
-    // those stale objects were stored on the court, then later returned to
-    // the queue when the game ends, the count would silently reset to
-    // "before this game" every time, which is exactly why games_played
-    // appeared to stop counting after the first game.
-      const incrementedGroup = group.map((p) => ({ ...p, gamesPlayed: p.gamesPlayed + 1 }));
+      // From here on, use players with their INCREMENTED games_played. The
+      // `group` array up to this point still holds the pre-game counts — if
+      // those stale objects were stored on the court, then later returned to
+      // the queue when the game ends, the count would silently reset to
+      // "before this game" every time, which is exactly why games_played
+      // appeared to stop counting after the first game.
+      const incrementedGroup = orderedGroup.map((p) => ({ ...p, gamesPlayed: p.gamesPlayed + 1 }));
 
       const assignedIds = new Set(incrementedGroup.map((p) => p.id));
       const updatedPlayers = playersRef.current.filter((p) => !assignedIds.has(p.id));
@@ -622,7 +681,7 @@ function Dashboard({ session }: DashboardProps) {
       return { court: openCourt, group: incrementedGroup };
     });
 
-if (assignment && voiceEnabled && isSpeechSupported()) {
+    if (assignment && voiceEnabled && isSpeechSupported()) {
       announcementCancelled.current = false;
       const names = assignment.group.map((p) => p.name).join(', ');
       const announcement = `${assignment.court.name}. ${names}.`;
@@ -718,6 +777,7 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
         partnerId: data.partner_id,
         gamesPlayed: data.games_played ?? 0,
         skillLevel: (data.skill_level as SkillLevel) ?? 'beginner',
+        wins: data.wins ?? 0,
       };
       const updated = [...playersRef.current, newPlayer];
       playersRef.current = updated;
@@ -770,6 +830,7 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
         partnerId: p.partner_id,
         gamesPlayed: p.games_played ?? 0,
         skillLevel: (p.skill_level as SkillLevel) ?? 'beginner',
+        wins: p.wins ?? 0,
       }));
 
       const updated = [...playersRef.current, ...newPlayers];
@@ -866,55 +927,109 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
     });
   }
 
-    async function handleEndGame(courtId: number) {
+  // Clears a court and returns its 4 players to the queue — backfilling
+  // any short trailing stack first, same as before. Factored out as its
+  // own plain async function (not wrapped in runExclusive itself) so both
+  // handleEndGame and handleRecordWin can call it after doing their own
+  // work, inside a single shared runExclusive call each — calling
+  // runExclusive from inside another runExclusive call would deadlock,
+  // since it just chains onto the same lock.
+  async function performCourtClear(courtId: number) {
+    const court = courtsRef.current.find((c) => c.id === courtId);
+    if (!court) return;
+
+    const { error: courtError } = await supabase
+      .from('courts')
+      .update({ player_ids: [], start_time: null })
+      .eq('id', courtId);
+
+    if (courtError) console.error('Error clearing court:', courtError);
+
+    const waitingUnits = buildUnits(playersRef.current);
+    const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
+    const lastStack = waitingStacks[waitingStacks.length - 1];
+    const vacancies = lastStack ? 4 - lastStack.length : 0;
+
+    let backfill: Player[] = [];
+    let leftover: Player[] = court.players;
+
+    if (vacancies > 0 && court.players.length > 0) {
+      const shuffled = shuffleArray(court.players);
+      const count = Math.min(vacancies, shuffled.length);
+      backfill = shuffled.slice(0, count);
+      leftover = shuffled.slice(count);
+    }
+
+    const orderedRequeue = [...backfill, ...leftover];
+    for (const player of orderedRequeue) {
+      const { error: requeueError } = await supabase
+        .from('players')
+        .update({ queue_position: nextQueuePosition() })
+        .eq('id', player.id);
+
+      if (requeueError) console.error('Error requeuing player:', requeueError);
+    }
+
+    const updatedPlayers = [...playersRef.current, ...backfill, ...leftover];
+    const updatedCourts = courtsRef.current.map((c) =>
+      c.id === courtId ? { ...c, players: [], startTime: null } : c
+    );
+
+    playersRef.current = updatedPlayers;
+    courtsRef.current = updatedCourts;
+    setPlayers(updatedPlayers);
+    setCourts(updatedCourts);
+  }
+
+  // Ends a game with no score recorded — same clearing/backfill behavior
+  // as always, just no win/match bookkeeping attached.
+  async function handleEndGame(courtId: number) {
+    stopSpeaking();
+    announcementCancelled.current = true;
+    await runExclusive(() => performCourtClear(courtId));
+  }
+
+  // Records which side won: logs the match, credits both winning players
+  // a win, then clears/requeues the court exactly like handleEndGame.
+  async function handleRecordWin(courtId: number, winningSide: 'a' | 'b') {
     stopSpeaking();
     announcementCancelled.current = true;
 
     await runExclusive(async () => {
       const court = courtsRef.current.find((c) => c.id === courtId);
-      if (!court) return;
+      if (!court || court.players.length < 4) return;
 
-      const { error: courtError } = await supabase
-        .from('courts')
-        .update({ player_ids: [], start_time: null })
-        .eq('id', courtId);
+      const teamA = court.players.slice(0, 2);
+      const teamB = court.players.slice(2, 4);
+      const winners = winningSide === 'a' ? teamA : teamB;
 
-      if (courtError) console.error('Error ending game:', courtError);
+      const { error: matchError } = await supabase.from('matches').insert({
+        owner_id: session.user.id,
+        court_id: courtId,
+        court_name: court.name,
+        team_a_names: teamA.map((p) => p.name),
+        team_b_names: teamB.map((p) => p.name),
+        winner_team: winningSide,
+      });
+      if (matchError) console.error('Error recording match:', matchError);
 
-      const waitingUnits = buildUnits(playersRef.current);
-      const waitingStacks = buildQueueGroups(waitingUnits, 4, MAX_QUEUE_STACKS);
-      const lastStack = waitingStacks[waitingStacks.length - 1];
-      const vacancies = lastStack ? 4 - lastStack.length : 0;
-
-      let backfill: Player[] = [];
-      let leftover: Player[] = court.players;
-
-      if (vacancies > 0 && court.players.length > 0) {
-        const shuffled = shuffleArray(court.players);
-        const count = Math.min(vacancies, shuffled.length);
-        backfill = shuffled.slice(0, count);
-        leftover = shuffled.slice(count);
-      }
-
-      const orderedRequeue = [...backfill, ...leftover];
-      for (const player of orderedRequeue) {
-        const { error: requeueError } = await supabase
+      for (const player of winners) {
+        const { error: winError } = await supabase
           .from('players')
-          .update({ queue_position: nextQueuePosition() })
+          .update({ wins: player.wins + 1 })
           .eq('id', player.id);
-
-        if (requeueError) console.error('Error requeuing player:', requeueError);
+        if (winError) console.error('Error updating wins:', winError);
       }
 
-      const updatedPlayers = [...playersRef.current, ...backfill, ...leftover];
-      const updatedCourts = courtsRef.current.map((c) =>
-        c.id === courtId ? { ...c, players: [], startTime: null } : c
+      const winnerIds = new Set(winners.map((p) => p.id));
+      courtsRef.current = courtsRef.current.map((c) =>
+        c.id === courtId
+          ? { ...c, players: c.players.map((p) => (winnerIds.has(p.id) ? { ...p, wins: p.wins + 1 } : p)) }
+          : c
       );
+      setAllPlayers((prev) => prev.map((p) => (winnerIds.has(p.id) ? { ...p, wins: p.wins + 1 } : p)));
 
-      playersRef.current = updatedPlayers;
-      courtsRef.current = updatedCourts;
-      setPlayers(updatedPlayers);
-      setCourts(updatedCourts);
+      await performCourtClear(courtId);
     });
   }
 
@@ -922,7 +1037,7 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
     const userId = session.user.id;
 
     const confirmed = window.confirm(
-      'Reset the entire session? This will remove all players and clear all courts.'
+      'Reset the entire session? This will remove all players, clear all courts, and delete the match history.'
     );
     if (!confirmed) return;
 
@@ -947,10 +1062,16 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
         .delete()
         .eq('owner_id', userId);
 
+      const { error: resetMatchesError } = await supabase
+        .from('matches')
+        .delete()
+        .eq('owner_id', userId);
+
       if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
       if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
       if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
       if (resetHistoryError) console.error('Error clearing group history:', resetHistoryError);
+      if (resetMatchesError) console.error('Error clearing matches:', resetMatchesError);
 
       await loadData();
     });
@@ -1049,8 +1170,12 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
   );
 
   const leaderboardResults = [...allPlayers]
-  .filter((p) => p.name.toLowerCase().includes(leaderboardSearch.trim().toLowerCase()))
-  .sort((a, b) => b.gamesPlayed - a.gamesPlayed);
+    .filter((p) => p.name.toLowerCase().includes(leaderboardSearch.trim().toLowerCase()))
+    .sort((a, b) => b.gamesPlayed - a.gamesPlayed);
+
+  const winLeaderboardResults = [...allPlayers]
+    .filter((p) => p.name.toLowerCase().includes(winLeaderboardSearch.trim().toLowerCase()))
+    .sort((a, b) => b.wins - a.wins);
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -1232,12 +1357,13 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
                   timeBased={timeBased}
                   onEndGame={handleEndGame}
                   onAnnounce={handleAnnounceCourt}
+                  onRecordWin={handleRecordWin}
                 />
               ))}
             </div>
           </div>
 
-{/* Games Played lookup */}
+          {/* Games Played lookup */}
           <div>
             <button
               onClick={() => setShowLeaderboard((v) => !v)}
@@ -1362,6 +1488,115 @@ if (assignment && voiceEnabled && isSpeechSupported()) {
             </div>
           </div>
         )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
+          {/* Matches Played */}
+          <div>
+            <button
+              onClick={() => setShowMatches((v) => !v)}
+              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
+            >
+              <span>📋 Matches Played</span>
+              <svg
+                className={`w-4 h-4 transition-transform ${showMatches ? 'rotate-180' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {showMatches && (
+              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
+                {matches.length === 0 ? (
+                  <p className="text-gray-300 text-sm">No matches recorded yet</p>
+                ) : (
+                  <ul className="space-y-2 max-h-72 overflow-y-auto">
+                    {matches.map((m) => (
+                      <li key={m.id} className="bg-gray-50 rounded-lg px-3 py-2 text-sm">
+                        <p className="text-xs font-bold text-gray-400 mb-1">{m.courtName}</p>
+                        <p className="flex items-center gap-1.5 flex-wrap">
+                          <span className={m.winnerTeam === 'a' ? 'font-bold text-green-600' : 'text-gray-500'}>
+                            {m.teamANames.join(' & ')}
+                          </span>
+                          <span className="text-gray-300">vs</span>
+                          <span className={m.winnerTeam === 'b' ? 'font-bold text-green-600' : 'text-gray-500'}>
+                            {m.teamBNames.join(' & ')}
+                          </span>
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Leaderboard by wins */}
+          <div>
+            <button
+              onClick={() => setShowWinLeaderboard((v) => !v)}
+              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
+            >
+              <span>🏆 Leaderboard</span>
+              <svg
+                className={`w-4 h-4 transition-transform ${showWinLeaderboard ? 'rotate-180' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {showWinLeaderboard && (
+              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
+                <div className="relative mb-3">
+                  <svg
+                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <circle cx="11" cy="11" r="7" />
+                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
+                  </svg>
+                  <input
+                    type="text"
+                    value={winLeaderboardSearch}
+                    onChange={(e) => setWinLeaderboardSearch(e.target.value)}
+                    placeholder="Search players..."
+                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                  />
+                </div>
+
+                {winLeaderboardResults.length === 0 ? (
+                  <p className="text-gray-300 text-sm">
+                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
+                  </p>
+                ) : (
+                  <ul className="space-y-2 max-h-64 overflow-y-auto">
+                    {winLeaderboardResults.map((player, i) => (
+                      <li
+                        key={player.id}
+                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-xs font-bold text-gray-400 w-4 shrink-0">{i + 1}</span>
+                          <SkillBadge level={player.skillLevel} />
+                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                        </div>
+                        <span className="text-sm font-bold text-green-600 shrink-0">{player.wins}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {showBatchModal && (

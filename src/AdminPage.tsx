@@ -102,7 +102,7 @@ function AdminPage() {
       mapped.map((c) => ({
         ...c,
         players: occupied.has(c.id)
-          ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const }]
+          ? [{ id: -1, name: '', partnerId: null, gamesPlayed: 0, skillLevel: 'beginner' as const, wins: 0 }]
           : [],
       }))
     );
