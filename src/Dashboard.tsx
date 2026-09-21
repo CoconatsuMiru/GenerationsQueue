@@ -126,6 +126,13 @@ function nextQueuePosition(): number {
   return lastQueuePosition;
 }
 
+// A queue position that sorts ahead of every normal position (those are
+// Date.now() timestamps). Used to put a player who was swapped OFF a court
+// at the front of the line — they didn't get to play, so they're next.
+function frontQueuePosition(): number {
+  return Date.now() - 1e13;
+}
+
 function pairKey(idA: number, idB: number): string {
   return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
 }
@@ -187,6 +194,20 @@ function skillCompatible(a: SkillLevel, b: SkillLevel): boolean {
 
 function unitCompatibleWithGroup(unit: Player[], group: Player[]): boolean {
   return unit.every((u) => group.every((g) => skillCompatible(u.skillLevel, g.skillLevel)));
+}
+
+// Court editor rule: who may be brought in to replace someone on a court.
+// The candidate must (1) still be waiting, (2) not be half of a waiting
+// pair — pairs always move together, so a pair member can't be pulled in
+// alone (unpair them in Manage Queue first), and (3) be skill-compatible
+// with the three players who STAY on the court (Beginner and Advanced
+// never mix; Intermediate fits anyone).
+function isEligibleReplacement(candidate: Player, courtmates: Player[], waiting: Player[]): boolean {
+  if (!waiting.some((p) => p.id === candidate.id)) return false;
+
+  if (candidate.partnerId !== null && waiting.some((p) => p.id === candidate.partnerId)) return false;
+
+  return unitCompatibleWithGroup([candidate], courtmates);
 }
 
 // Builds one candidate group that ALWAYS includes `anchor` — the
@@ -345,6 +366,11 @@ function Dashboard({ session }: DashboardProps) {
   const [showWinLeaderboard, setShowWinLeaderboard] = useState(false);
   const [winLeaderboardSearch, setWinLeaderboardSearch] = useState('');
 
+  // Court editor modal
+  const [editingCourtId, setEditingCourtId] = useState<number | null>(null);
+  const [editAction, setEditAction] = useState<{ type: 'replace' | 'swap'; slot: number } | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+
   const [isSessionActive, setIsSessionActive] = useState(false);
 
   const [timeBased, setTimeBased] = useState(true);
@@ -398,6 +424,17 @@ function Dashboard({ session }: DashboardProps) {
     courtsRef.current = courts;
   }, [courts]);
 
+  // If the court being edited ends its game (or is removed) while the
+  // editor is open, close the editor instead of leaving it stranded.
+  useEffect(() => {
+    if (editingCourtId === null) return;
+    const court = courts.find((c) => c.id === editingCourtId);
+    if (!court || court.players.length < 4) {
+      setEditingCourtId(null);
+      setEditAction(null);
+    }
+  }, [courts, editingCourtId]);
+
   async function loadData() {
     const userId = session.user.id;
 
@@ -411,6 +448,7 @@ function Dashboard({ session }: DashboardProps) {
       console.error('SESSION READ ERROR:', sessionReadError);
     }
 
+    // eslint-disable-next-line no-useless-assignment
     let sessionActive = false;
     let isNewAccount = false;
 
@@ -519,6 +557,7 @@ function Dashboard({ session }: DashboardProps) {
   }
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1045,6 +1084,166 @@ function Dashboard({ session }: DashboardProps) {
     });
   }
 
+  // ---------- Court editor ----------
+
+  function openCourtEditor(courtId: number) {
+    setEditingCourtId(courtId);
+    setEditAction(null);
+  }
+
+  function closeCourtEditor() {
+    setEditingCourtId(null);
+    setEditAction(null);
+  }
+
+  // Adds `delta` to the "played together" count for one pair of players,
+  // in both the DB and the local cache (never below zero). Used so pairing
+  // history only reflects who actually shared a court.
+  async function adjustPairCount(idA: number, idB: number, delta: number) {
+    const key = pairKey(idA, idB);
+    const newCount = Math.max(0, (groupHistoryRef.current.get(key) ?? 0) + delta);
+    const [playerAId, playerBId] = idA < idB ? [idA, idB] : [idB, idA];
+
+    const { error } = await supabase.from('group_history').upsert(
+      {
+        owner_id: session.user.id,
+        player_a_id: playerAId,
+        player_b_id: playerBId,
+        count: newCount,
+      },
+      { onConflict: 'owner_id,player_a_id,player_b_id' }
+    );
+
+    if (error) console.error('Error adjusting group_history:', error);
+
+    groupHistoryRef.current.set(key, newCount);
+  }
+
+  // Replaces one player on a live court with an eligible waiting player.
+  // Games-played follows who actually played: the incoming player is
+  // credited a game, and the outgoing player loses the game that was
+  // counted when the court started (they go to the FRONT of the queue).
+  // The game timer and start time are untouched.
+  async function handleReplaceCourtPlayer(courtId: number, slotIndex: number, incomingId: number) {
+    if (editBusy) return;
+    setEditBusy(true);
+
+    try {
+      await runExclusive(async () => {
+        const court = courtsRef.current.find((c) => c.id === courtId);
+        if (!court || court.players.length < 4) return;
+
+        const outgoing = court.players[slotIndex];
+        const incoming = playersRef.current.find((p) => p.id === incomingId);
+        if (!outgoing || !incoming) return;
+
+        const courtmates = court.players.filter((_, i) => i !== slotIndex);
+
+        // Re-check eligibility against the latest state — the queue may
+        // have changed since the editor list was drawn.
+        if (!isEligibleReplacement(incoming, courtmates, playersRef.current)) return;
+
+        const newIds = court.players.map((p, i) => (i === slotIndex ? incoming.id : p.id));
+
+        const { error: courtError } = await supabase
+          .from('courts')
+          .update({ player_ids: newIds })
+          .eq('id', courtId);
+
+        if (courtError) {
+          console.error('Error replacing court player:', courtError);
+          return;
+        }
+
+        const outgoingGames = Math.max(0, outgoing.gamesPlayed - 1);
+        const incomingGames = incoming.gamesPlayed + 1;
+
+        const { error: outError } = await supabase
+          .from('players')
+          .update({ games_played: outgoingGames, queue_position: frontQueuePosition() })
+          .eq('id', outgoing.id);
+        if (outError) console.error('Error updating replaced player:', outError);
+
+        const { error: inError } = await supabase
+          .from('players')
+          .update({ games_played: incomingGames })
+          .eq('id', incoming.id);
+        if (inError) console.error('Error updating incoming player:', inError);
+
+        // Pairing history: the replaced player never actually shared this
+        // court with the other three, and the new player now does.
+        for (const mate of courtmates) {
+          await adjustPairCount(outgoing.id, mate.id, -1);
+          await adjustPairCount(incoming.id, mate.id, 1);
+        }
+
+        const outgoingBack: Player = { ...outgoing, gamesPlayed: outgoingGames };
+        const incomingOnCourt: Player = { ...incoming, gamesPlayed: incomingGames };
+
+        const updatedPlayers = [outgoingBack, ...playersRef.current.filter((p) => p.id !== incoming.id)];
+        const updatedCourts = courtsRef.current.map((c) =>
+          c.id === courtId
+            ? { ...c, players: c.players.map((p, i) => (i === slotIndex ? incomingOnCourt : p)) }
+            : c
+        );
+
+        playersRef.current = updatedPlayers;
+        courtsRef.current = updatedCourts;
+        setPlayers(updatedPlayers);
+        setCourts(updatedCourts);
+        setAllPlayers((prev) =>
+          prev.map((p) => {
+            if (p.id === outgoing.id) return { ...p, gamesPlayed: outgoingGames };
+            if (p.id === incoming.id) return { ...p, gamesPlayed: incomingGames };
+            return p;
+          })
+        );
+      });
+    } finally {
+      setEditBusy(false);
+      setEditAction(null);
+    }
+  }
+
+  // Swaps two positions on a live court. Positions 0-1 are Team A (left)
+  // and 2-3 are Team B (right), so swapping across teams is how you change
+  // who partners with whom. No one enters or leaves, so counts and pairing
+  // history stay exactly as they are.
+  async function handleSwapCourtPlayers(courtId: number, indexA: number, indexB: number) {
+    if (indexA === indexB || editBusy) return;
+    setEditBusy(true);
+
+    try {
+      await runExclusive(async () => {
+        const court = courtsRef.current.find((c) => c.id === courtId);
+        if (!court || court.players.length < 4) return;
+
+        const reordered = [...court.players];
+        [reordered[indexA], reordered[indexB]] = [reordered[indexB], reordered[indexA]];
+
+        const { error } = await supabase
+          .from('courts')
+          .update({ player_ids: reordered.map((p) => p.id) })
+          .eq('id', courtId);
+
+        if (error) {
+          console.error('Error swapping court players:', error);
+          return;
+        }
+
+        const updatedCourts = courtsRef.current.map((c) =>
+          c.id === courtId ? { ...c, players: reordered } : c
+        );
+
+        courtsRef.current = updatedCourts;
+        setCourts(updatedCourts);
+      });
+    } finally {
+      setEditBusy(false);
+      setEditAction(null);
+    }
+  }
+
   async function handleResetSession() {
     const userId = session.user.id;
 
@@ -1193,6 +1392,35 @@ function Dashboard({ session }: DashboardProps) {
     .filter(({ player }) =>
       player.name.toLowerCase().includes(winLeaderboardSearch.trim().toLowerCase())
     );
+
+  // Court editor derived values. The editor only opens for a court with a
+  // full group of 4 on it.
+  const foundEditingCourt = editingCourtId !== null ? courts.find((c) => c.id === editingCourtId) : undefined;
+  const editingCourt = foundEditingCourt && foundEditingCourt.players.length === 4 ? foundEditingCourt : null;
+
+  const replaceSlot = editAction?.type === 'replace' ? editAction.slot : null;
+  const swapSlot = editAction?.type === 'swap' ? editAction.slot : null;
+
+  const replacedPlayer =
+    editingCourt && replaceSlot !== null ? editingCourt.players[replaceSlot] : undefined;
+
+  // Only eligible waiting players, fewest games played first so organizers
+  // can see at a glance who is owed a game.
+  const replaceCandidates: Player[] =
+    editingCourt && replaceSlot !== null
+      ? players
+          .filter((p) =>
+            isEligibleReplacement(
+              p,
+              editingCourt.players.filter((_, i) => i !== replaceSlot),
+              players
+            )
+          )
+          .sort((a, b) => a.gamesPlayed - b.gamesPlayed)
+      : [];
+
+  const minCandidateGames = replaceCandidates.length > 0 ? replaceCandidates[0].gamesPlayed : 0;
+  const hiddenCandidateCount = players.length - replaceCandidates.length;
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -1375,6 +1603,7 @@ function Dashboard({ session }: DashboardProps) {
                 onEndGame={handleEndGame}
                 onAnnounce={handleAnnounceCourt}
                 onRecordWin={handleRecordWin}
+                onEdit={openCourtEditor}
               />
             ))}
           </div>
@@ -1585,6 +1814,189 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         </div>
       </div>
+
+      {/* Court editor modal */}
+      {editingCourt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={closeCourtEditor} />
+
+          <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto animate-modal-in">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 sticky top-0 bg-white z-10">
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-gray-800 truncate">Edit {editingCourt.name}</h2>
+                <p className="text-xs text-gray-400">The game timer keeps running while you make changes.</p>
+              </div>
+              <button
+                onClick={closeCourtEditor}
+                className="text-gray-400 hover:text-gray-600 w-8 h-8 rounded-full hover:bg-gray-100 flex items-center justify-center transition-colors shrink-0"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {swapSlot !== null ? (
+                <p className="text-xs font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                  Choose who to swap {editingCourt.players[swapSlot]?.name} with. Swapping across teams changes who
+                  partners with whom.
+                </p>
+              ) : replaceSlot === null ? (
+                <p className="text-xs text-gray-500">
+                  <span className="font-semibold text-gray-700">Replace</span> brings in a waiting player.{' '}
+                  <span className="font-semibold text-gray-700">Swap</span> changes positions — move players across
+                  teams to change partnerships. Game counts are shown for each player.
+                </p>
+              ) : null}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {[
+                  { label: 'Team A · left side', slots: [0, 1] },
+                  { label: 'Team B · right side', slots: [2, 3] },
+                ].map((team) => (
+                  <div key={team.label}>
+                    <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">{team.label}</h3>
+                    <ul className="space-y-2">
+                      {team.slots.map((slot) => {
+                        const player = editingCourt.players[slot];
+                        const isSource = replaceSlot === slot || swapSlot === slot;
+
+                        return (
+                          <li
+                            key={player.id}
+                            className={`rounded-lg border px-3 py-2 transition-colors ${
+                              replaceSlot === slot
+                                ? 'border-green-500 bg-green-50'
+                                : swapSlot === slot
+                                ? 'border-purple-400 bg-purple-50'
+                                : 'border-gray-200 bg-gray-50'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <SkillBadge level={player.skillLevel} />
+                                <span className="text-sm font-semibold text-gray-800 truncate">{player.name}</span>
+                              </div>
+                              <span className="shrink-0 text-xs font-semibold text-gray-500 bg-white border border-gray-200 rounded-full px-2 py-0.5">
+                                {player.gamesPlayed} {player.gamesPlayed === 1 ? 'game' : 'games'}
+                              </span>
+                            </div>
+
+                            <div className="flex gap-1.5 mt-2">
+                              {swapSlot !== null && swapSlot !== slot ? (
+                                <button
+                                  disabled={editBusy}
+                                  onClick={() => handleSwapCourtPlayers(editingCourt.id, swapSlot, slot)}
+                                  className="flex-1 text-xs font-semibold bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-2.5 py-1.5 rounded-md transition-colors"
+                                >
+                                  Swap here
+                                </button>
+                              ) : isSource ? (
+                                <button
+                                  onClick={() => setEditAction(null)}
+                                  className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                >
+                                  Cancel
+                                </button>
+                              ) : (
+                                <>
+                                  <button
+                                    disabled={editBusy}
+                                    onClick={() => setEditAction({ type: 'replace', slot })}
+                                    className="flex-1 text-xs font-semibold bg-green-100 hover:bg-green-200 disabled:opacity-50 disabled:cursor-not-allowed text-green-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                  >
+                                    Replace
+                                  </button>
+                                  <button
+                                    disabled={editBusy}
+                                    onClick={() => setEditAction({ type: 'swap', slot })}
+                                    className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 disabled:opacity-50 disabled:cursor-not-allowed text-purple-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                  >
+                                    Swap
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+
+              {replaceSlot !== null && replacedPlayer && (
+                <div className="rounded-xl border border-green-200 bg-green-50/60 p-4">
+                  <div className="flex items-center justify-between mb-1">
+                    <h3 className="text-sm font-bold text-gray-800">Replace {replacedPlayer.name} with…</h3>
+                    <button
+                      onClick={() => setEditAction(null)}
+                      className="text-xs font-semibold text-green-700 hover:text-green-900"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-3">
+                    The new player is credited 1 game. {replacedPlayer.name} loses the game counted for this court and
+                    goes to the front of the queue.
+                  </p>
+
+                  {replaceCandidates.length === 0 ? (
+                    <p className="text-sm text-gray-500 bg-white rounded-lg px-3 py-3 border border-gray-100">
+                      No eligible players right now. Only unpaired waiting players who are skill-compatible with the
+                      other three on this court can be brought in.
+                    </p>
+                  ) : (
+                    <ul className="space-y-2 max-h-60 overflow-y-auto">
+                      {replaceCandidates.map((candidate) => (
+                        <li
+                          key={candidate.id}
+                          className="flex items-center justify-between gap-2 bg-white rounded-lg px-3 py-2 border border-gray-100"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className="text-xs font-bold text-gray-400 w-7 shrink-0"
+                              title="Position in the waiting queue"
+                            >
+                              #{players.findIndex((p) => p.id === candidate.id) + 1}
+                            </span>
+                            <SkillBadge level={candidate.skillLevel} />
+                            <span className="text-sm font-medium text-gray-800 truncate">{candidate.name}</span>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span
+                              className={`text-xs font-bold tabular-nums ${
+                                candidate.gamesPlayed === minCandidateGames ? 'text-green-600' : 'text-gray-500'
+                              }`}
+                            >
+                              {candidate.gamesPlayed} {candidate.gamesPlayed === 1 ? 'game' : 'games'}
+                            </span>
+                            <button
+                              disabled={editBusy}
+                              onClick={() => handleReplaceCourtPlayer(editingCourt.id, replaceSlot, candidate.id)}
+                              className="text-xs font-semibold bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md transition-colors"
+                            >
+                              Bring in
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  {hiddenCandidateCount > 0 && (
+                    <p className="text-[11px] text-gray-400 mt-3">
+                      {hiddenCandidateCount} other waiting player{hiddenCandidateCount === 1 ? '' : 's'} not shown —
+                      skill mismatch, or part of a pair (unpair them in Manage Queue first).
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {showBatchModal && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">

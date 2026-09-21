@@ -11,6 +11,7 @@ interface CourtCardProps {
   onEndGame: (courtId: number) => void;
   onAnnounce: (courtId: number) => void;
   onRecordWin: (courtId: number, side: 'a' | 'b') => void;
+  onEdit: (courtId: number) => void;
 }
 
 type Phase = 'open' | 'warmup' | 'playing' | 'overtime';
@@ -122,6 +123,7 @@ function CourtCard({
   onEndGame,
   onAnnounce,
   onRecordWin,
+  onEdit,
 }: CourtCardProps) {
   const phase = getPhase(court, warmupMinutes, gameLengthMinutes, timeBased);
   const isOpen = phase === 'open';
@@ -177,16 +179,27 @@ function CourtCard({
 
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-lg font-bold text-gray-800 tracking-tight">{court.name}</h3>
-        <span className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${badgeStyle}`}>
+        <div className="flex items-center gap-2">
           {!isOpen && (
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                phase === 'playing' ? 'bg-green-500 animate-pulse' : phase === 'overtime' ? 'bg-orange-500 animate-pulse' : 'bg-yellow-500'
-              }`}
-            />
+            <button
+              onClick={() => onEdit(court.id)}
+              title="Edit this court's players"
+              className="flex items-center gap-1 text-xs font-semibold text-gray-500 hover:text-gray-800 bg-gray-100 hover:bg-gray-200 px-2.5 py-1 rounded-full transition-colors"
+            >
+              ✎ Edit
+            </button>
           )}
-          {badgeLabel}
-        </span>
+          <span className={`flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${badgeStyle}`}>
+            {!isOpen && (
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  phase === 'playing' ? 'bg-green-500 animate-pulse' : phase === 'overtime' ? 'bg-orange-500 animate-pulse' : 'bg-yellow-500'
+                }`}
+              />
+            )}
+            {badgeLabel}
+          </span>
+        </div>
       </div>
 
       {/* Pickleball court, top-down: baseline | service boxes | kitchen | net | kitchen | service boxes | baseline */}
