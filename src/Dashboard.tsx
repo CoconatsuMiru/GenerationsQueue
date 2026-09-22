@@ -158,9 +158,28 @@ function unitGamesPlayed(unit: Player[]): number {
   return Math.max(...unit.map((p) => p.gamesPlayed));
 }
 
-function unitSkillLevel(unit: Player[]): SkillLevel | null {
+const SKILL_LEVEL_ORDER: Record<SkillLevel, number> = {
+  beginner: 0,
+  intermediate: 1,
+  advanced: 2,
+};
+
+// Tournament-style pair classification: a pair is always treated as
+// whichever member has the HIGHER skill level — e.g. a Beginner paired
+// with an Advanced player queues and matches as an Advanced pair, not a
+// Beginner one. Mirrors how real doubles tournaments classify a team by
+// its stronger player, and applies everywhere a pair's "level" matters:
+// fairness tiering, group formation when a court opens up, and the court
+// editor's replacement-eligibility list.
+function higherSkillLevel(a: SkillLevel, b: SkillLevel): SkillLevel {
+  return SKILL_LEVEL_ORDER[a] >= SKILL_LEVEL_ORDER[b] ? a : b;
+}
+
+// A unit's effective skill level for matching purposes: a solo player's
+// own level, or — for a pair — the higher of the two partners' levels.
+function unitSkillLevel(unit: Player[]): SkillLevel {
   if (unit.length === 1) return unit[0].skillLevel;
-  return unit[0].skillLevel === unit[1].skillLevel ? unit[0].skillLevel : null;
+  return higherSkillLevel(unit[0].skillLevel, unit[1].skillLevel);
 }
 
 function selectFairnessTier(pool: Player[][]): Player[][] {
@@ -308,7 +327,8 @@ function pickLowestScored(
 // Within that fairness tier, we still try to fill the court from a single
 // skill level first (checked against whichever level appears earliest in
 // the tier), falling back to a mixed-level group only if the tier doesn't
-// have 4 players of one level.
+// have 4 players of one level. A pair's "level" here is always its
+// higher-rated partner (see unitSkillLevel).
 function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): Player[] | null {
   const units = buildUnits(players);
 
