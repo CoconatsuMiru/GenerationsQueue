@@ -14,7 +14,7 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-
+const LOCKED_PREVIEW_COUNT = 3;
 
 interface DashboardProps {
   session: Session;
@@ -137,23 +137,6 @@ function pairKey(idA: number, idB: number): string {
   return idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`;
 }
 
-// Ranking order for the Leaderboard: players who have played come first,
-// sorted by win percentage, then total wins, then name. Players with a
-// 0-0 record sit at the bottom.
-function compareByRecord(a: Player, b: Player): number {
-  const totalA = a.wins + a.losses;
-  const totalB = b.wins + b.losses;
-
-  if ((totalA === 0) !== (totalB === 0)) return totalA === 0 ? 1 : -1;
-
-  const pctA = totalA > 0 ? a.wins / totalA : 0;
-  const pctB = totalB > 0 ? b.wins / totalB : 0;
-
-  if (pctB !== pctA) return pctB - pctA;
-  if (b.wins !== a.wins) return b.wins - a.wins;
-  return a.name.localeCompare(b.name);
-}
-
 function unitGamesPlayed(unit: Player[]): number {
   return Math.max(...unit.map((p) => p.gamesPlayed));
 }
@@ -167,10 +150,9 @@ const SKILL_LEVEL_ORDER: Record<SkillLevel, number> = {
 // Tournament-style pair classification: a pair is always treated as
 // whichever member has the HIGHER skill level — e.g. a Beginner paired
 // with an Advanced player queues and matches as an Advanced pair, not a
-// Beginner one. Mirrors how real doubles tournaments classify a team by
-// its stronger player, and applies everywhere a pair's "level" matters:
-// fairness tiering, group formation when a court opens up, and the court
-// editor's replacement-eligibility list.
+// Beginner one. Applies everywhere a pair's "level" matters: fairness
+// tiering, group formation when a court opens up, and the court editor's
+// (and preview editor's) replacement-eligibility list.
 function higherSkillLevel(a: SkillLevel, b: SkillLevel): SkillLevel {
   return SKILL_LEVEL_ORDER[a] >= SKILL_LEVEL_ORDER[b] ? a : b;
 }
@@ -215,12 +197,12 @@ function unitCompatibleWithGroup(unit: Player[], group: Player[]): boolean {
   return unit.every((u) => group.every((g) => skillCompatible(u.skillLevel, g.skillLevel)));
 }
 
-// Court editor rule: who may be brought in to replace someone on a court.
-// The candidate must (1) still be waiting, (2) not be half of a waiting
-// pair — pairs always move together, so a pair member can't be pulled in
-// alone (unpair them in Manage Queue first), and (3) be skill-compatible
-// with the three players who STAY on the court (Beginner and Advanced
-// never mix; Intermediate fits anyone).
+// Court editor / preview editor rule: who may be brought in to replace
+// someone. The candidate must (1) still be waiting, (2) not be half of a
+// waiting pair — pairs always move together, so a pair member can't be
+// pulled in alone (unpair them in Manage Queue first), and (3) be
+// skill-compatible with the players who STAY (Beginner and Advanced never
+// mix; Intermediate fits anyone).
 function isEligibleReplacement(candidate: Player, courtmates: Player[], waiting: Player[]): boolean {
   if (!waiting.some((p) => p.id === candidate.id)) return false;
 
@@ -358,11 +340,70 @@ function chooseFairGroup(players: Player[], groupHistory: Map<string, number>): 
   return pickLowestScored(candidates, groupHistory);
 }
 
+// Produces up to `count` fair groups by repeatedly calling chooseFairGroup
+// and removing each result's players from the pool before picking the
+// next — this is how the Fair-mode preview gets its 2nd and 3rd stacks,
+// not just its 1st.
+function computeFairPreviewGroups(
+  pool: Player[],
+  groupHistory: Map<string, number>,
+  count: number
+): Player[][] {
+  const groups: Player[][] = [];
+  let remaining = [...pool];
+
+  for (let i = 0; i < count; i++) {
+    const group = chooseFairGroup(remaining, groupHistory);
+    if (!group) break;
+
+    groups.push(orderGroupIntoTeams(group));
+
+    const usedIds = new Set(group.map((p) => p.id));
+    remaining = remaining.filter((p) => !usedIds.has(p.id));
+  }
+
+  return groups;
+}
+
+// Validates the current locked preview groups against the live waiting
+// list (dropping any group that's lost a player — e.g. someone was
+// removed entirely), then tops the list back up to LOCKED_PREVIEW_COUNT
+// using the normal fairness algorithm on whatever waiting players aren't
+// already reserved by a still-valid locked group.
+function refreshLockedGroups(
+  currentLocked: Player[][],
+  waitingPlayers: Player[],
+  groupHistory: Map<string, number>
+): Player[][] {
+  const waitingIds = new Set(waitingPlayers.map((p) => p.id));
+  const valid = currentLocked.filter((group) => group.every((p) => waitingIds.has(p.id)));
+
+  const reservedIds = new Set(valid.flatMap((g) => g.map((p) => p.id)));
+  const pool = waitingPlayers.filter((p) => !reservedIds.has(p.id));
+
+  const needed = LOCKED_PREVIEW_COUNT - valid.length;
+  if (needed <= 0) return valid;
+
+  const newGroups = computeFairPreviewGroups(pool, groupHistory, needed);
+  return [...valid, ...newGroups];
+}
+
+function areGroupsEqual(a: Player[][], b: Player[][]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].length !== b[i].length) return false;
+    for (let j = 0; j < a[i].length; j++) {
+      if (a[i][j].id !== b[i][j].id) return false;
+    }
+  }
+  return true;
+}
+
 function Dashboard({ session }: DashboardProps) {
   const navigate = useNavigate();
 
   const [players, setPlayers] = useState<Player[]>([]);
-  const [allPlayers, setAllPlayers] = useState<Player[]>([]); // full roster (waiting + playing), for the leaderboards
+  const [allPlayers, setAllPlayers] = useState<Player[]>([]); // full roster (waiting + playing), for the Games Played lookup
   const [nameInput, setNameInput] = useState('');
   const [nameLevel, setNameLevel] = useState<SkillLevel>('beginner');
 
@@ -382,14 +423,19 @@ function Dashboard({ session }: DashboardProps) {
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [leaderboardSearch, setLeaderboardSearch] = useState('');
 
-  // Leaderboard (win-loss ranking) dropdown
-  const [showWinLeaderboard, setShowWinLeaderboard] = useState(false);
-  const [winLeaderboardSearch, setWinLeaderboardSearch] = useState('');
-
   // Court editor modal
   const [editingCourtId, setEditingCourtId] = useState<number | null>(null);
   const [editAction, setEditAction] = useState<{ type: 'replace' | 'swap'; slot: number } | null>(null);
   const [editBusy, setEditBusy] = useState(false);
+
+  // Fair-mode "Upcoming Stacks" preview (hard-locked groups)
+  const [lockedGroups, setLockedGroups] = useState<Player[][]>([]);
+  const lockedGroupsRef = useRef<Player[][]>([]);
+  const [editingPreviewIndex, setEditingPreviewIndex] = useState<number | null>(null);
+  const [previewEditAction, setPreviewEditAction] = useState<{ type: 'replace' | 'swap'; slot: number } | null>(
+    null
+  );
+  const [previewEditBusy, setPreviewEditBusy] = useState(false);
 
   const [isSessionActive, setIsSessionActive] = useState(false);
 
@@ -444,6 +490,10 @@ function Dashboard({ session }: DashboardProps) {
     courtsRef.current = courts;
   }, [courts]);
 
+  useEffect(() => {
+    lockedGroupsRef.current = lockedGroups;
+  }, [lockedGroups]);
+
   // If the court being edited ends its game (or is removed) while the
   // editor is open, close the editor instead of leaving it stranded.
   useEffect(() => {
@@ -454,6 +504,52 @@ function Dashboard({ session }: DashboardProps) {
       setEditAction(null);
     }
   }, [courts, editingCourtId]);
+
+  // Same idea for the preview editor — if the stack being edited gets
+  // consumed by an actual court assignment, or drops below 4 players for
+  // any reason, close the editor.
+  useEffect(() => {
+    if (editingPreviewIndex === null) return;
+    const group = lockedGroups[editingPreviewIndex];
+    if (!group || group.length < 4) {
+      setEditingPreviewIndex(null);
+      setPreviewEditAction(null);
+    }
+  }, [lockedGroups, editingPreviewIndex]);
+
+  async function saveLockedGroups(groups: Player[][]) {
+    const idGroups = groups.map((g) => g.map((p) => p.id));
+    const { error } = await supabase
+      .from('locked_queue')
+      .upsert({ owner_id: session.user.id, groups: idGroups }, { onConflict: 'owner_id' });
+
+    if (error) console.error('Error saving locked queue:', error);
+  }
+
+  // Re-validates and tops up the locked preview list, and persists it if
+  // anything actually changed. `modeOverride` lets loadData pass in the
+  // queue mode it just fetched, since React state (`queueMode`) hasn't
+  // committed yet at that point in the same synchronous function.
+  async function refreshAndPersistLockedGroups(modeOverride?: 'fifo' | 'fair') {
+    const mode = modeOverride ?? queueMode;
+
+    if (mode !== 'fair') {
+      if (lockedGroupsRef.current.length > 0) {
+        lockedGroupsRef.current = [];
+        setLockedGroups([]);
+        await saveLockedGroups([]);
+      }
+      return;
+    }
+
+    const refreshed = refreshLockedGroups(lockedGroupsRef.current, playersRef.current, groupHistoryRef.current);
+
+    if (!areGroupsEqual(refreshed, lockedGroupsRef.current)) {
+      lockedGroupsRef.current = refreshed;
+      setLockedGroups(refreshed);
+      await saveLockedGroups(refreshed);
+    }
+  }
 
   async function loadData() {
     const userId = session.user.id;
@@ -468,7 +564,6 @@ function Dashboard({ session }: DashboardProps) {
       console.error('SESSION READ ERROR:', sessionReadError);
     }
 
-    // eslint-disable-next-line no-useless-assignment
     let sessionActive = false;
     let isNewAccount = false;
 
@@ -497,11 +592,13 @@ function Dashboard({ session }: DashboardProps) {
 
     if (venueSettingsError) console.error('Error loading venue settings:', venueSettingsError);
 
+    const loadedQueueMode = (venueSettings?.queue_mode as 'fifo' | 'fair') ?? 'fair';
+
     setTimeBased(venueSettings?.time_based ?? true);
     setWarmupMinutes(venueSettings?.warmup_minutes ?? WARMUP_MINUTES);
     setGameMinutes(venueSettings?.game_minutes ?? GAME_LENGTH_MINUTES);
     setOvertimeMinutes(venueSettings?.overtime_minutes ?? OVERTIME_MINUTES);
-    setQueueMode((venueSettings?.queue_mode as 'fifo' | 'fair') ?? 'fair');
+    setQueueMode(loadedQueueMode);
 
     if (isNewAccount) {
       const { data: existingCourts } = await supabase
@@ -536,9 +633,16 @@ function Dashboard({ session }: DashboardProps) {
       .select('*')
       .eq('owner_id', userId);
 
+    const { data: dbLockedQueue, error: lockedQueueError } = await supabase
+      .from('locked_queue')
+      .select('*')
+      .eq('owner_id', userId)
+      .maybeSingle();
+
     if (playersError) console.error('Error loading players:', playersError);
     if (courtsError) console.error('Error loading courts:', courtsError);
     if (groupHistoryError) console.error('Error loading group history:', groupHistoryError);
+    if (lockedQueueError) console.error('Error loading locked queue:', lockedQueueError);
 
     const allPlayersList: Player[] = (dbPlayers ?? []).map((p) => ({
       id: p.id,
@@ -570,14 +674,30 @@ function Dashboard({ session }: DashboardProps) {
     });
     groupHistoryRef.current = historyMap;
 
+    const storedGroups: number[][] = dbLockedQueue?.groups ?? [];
+    const rebuiltGroups: Player[][] = storedGroups
+      .map((idGroup) =>
+        idGroup.map((id) => waitingPlayers.find((p) => p.id === id)).filter((p): p is Player => p !== undefined)
+      )
+      .filter((g) => g.length === 4);
+
     setPlayers(waitingPlayers);
     setAllPlayers(allPlayersList);
     setCourts(mappedCourts);
     setIsSessionActive(sessionActive);
+
+    // Set refs directly (not just state) since we need them immediately
+    // below, in the same synchronous pass — the mirroring useEffects
+    // above won't have run yet.
+    playersRef.current = waitingPlayers;
+    courtsRef.current = mappedCourts;
+    lockedGroupsRef.current = rebuiltGroups;
+    setLockedGroups(rebuiltGroups);
+
+    await refreshAndPersistLockedGroups(loadedQueueMode);
   }
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -616,6 +736,11 @@ function Dashboard({ session }: DashboardProps) {
         { event: '*', schema: 'public', table: 'venue_settings', filter: `owner_id=eq.${userId}` },
         scheduleReload
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'locked_queue', filter: `owner_id=eq.${userId}` },
+        scheduleReload
+      )
       .subscribe();
 
     return () => {
@@ -651,7 +776,18 @@ function Dashboard({ session }: DashboardProps) {
               const { group: fifoGroup } = selectNextGroup(buildUnits(playersRef.current), 4);
               return fifoGroup.length === 4 ? fifoGroup : null;
             })()
-          : chooseFairGroup(playersRef.current, groupHistoryRef.current);
+          : (() => {
+              // Fair mode: use the first locked preview group if it's
+              // still fully present in the waiting list — this is the
+              // "hard lock" behavior, overriding live fairness scoring
+              // whenever an organizer has planned ahead.
+              const waitingIds = new Set(playersRef.current.map((p) => p.id));
+              const firstLocked = lockedGroupsRef.current[0];
+              if (firstLocked && firstLocked.length === 4 && firstLocked.every((p) => waitingIds.has(p.id))) {
+                return firstLocked;
+              }
+              return chooseFairGroup(playersRef.current, groupHistoryRef.current);
+            })();
       if (!group) return null;
 
       // Reorder into [teamA0, teamA1, teamB0, teamB1] so partners always
@@ -730,6 +866,17 @@ function Dashboard({ session }: DashboardProps) {
       setPlayers(updatedPlayers);
       setCourts(updatedCourts);
       setAllPlayers((prev) => prev.map((p) => (bumped.has(p.id) ? { ...p, gamesPlayed: bumped.get(p.id)! } : p)));
+
+      // Consume the used locked group (if that's what was assigned) and
+      // top the preview back up to 3 using whoever's left waiting.
+      if (queueMode === 'fair') {
+        const usedIds = new Set(incrementedGroup.map((p) => p.id));
+        const remainingLocked = lockedGroupsRef.current.filter((g) => !g.some((p) => usedIds.has(p.id)));
+        const refreshed = refreshLockedGroups(remainingLocked, updatedPlayers, groupHistoryRef.current);
+        lockedGroupsRef.current = refreshed;
+        setLockedGroups(refreshed);
+        await saveLockedGroups(refreshed);
+      }
 
       return { court: openCourt, group: incrementedGroup };
     });
@@ -837,6 +984,8 @@ function Dashboard({ session }: DashboardProps) {
       playersRef.current = updated;
       setPlayers(updated);
       setAllPlayers((prev) => [...prev, newPlayer]);
+
+      await refreshAndPersistLockedGroups();
     });
   }
 
@@ -892,6 +1041,8 @@ function Dashboard({ session }: DashboardProps) {
       playersRef.current = updated;
       setPlayers(updated);
       setAllPlayers((prev) => [...prev, ...newPlayers]);
+
+      await refreshAndPersistLockedGroups();
     });
   }
 
@@ -921,6 +1072,8 @@ function Dashboard({ session }: DashboardProps) {
       playersRef.current = updated;
       setPlayers(updated);
       setAllPlayers((prev) => prev.filter((p) => p.id !== id));
+
+      await refreshAndPersistLockedGroups();
     });
   }
 
@@ -1034,6 +1187,8 @@ function Dashboard({ session }: DashboardProps) {
     courtsRef.current = updatedCourts;
     setPlayers(updatedPlayers);
     setCourts(updatedCourts);
+
+    await refreshAndPersistLockedGroups();
   }
 
   // Ends a game with no score recorded — same clearing/backfill behavior
@@ -1218,6 +1373,8 @@ function Dashboard({ session }: DashboardProps) {
             return p;
           })
         );
+
+        await refreshAndPersistLockedGroups();
       });
     } finally {
       setEditBusy(false);
@@ -1264,6 +1421,67 @@ function Dashboard({ session }: DashboardProps) {
     }
   }
 
+  // ---------- Fair-mode "Upcoming Stacks" preview editor ----------
+
+  function openPreviewEditor(index: number) {
+    setEditingPreviewIndex(index);
+    setPreviewEditAction(null);
+  }
+
+  function closePreviewEditor() {
+    setEditingPreviewIndex(null);
+    setPreviewEditAction(null);
+  }
+
+  // Swaps in a different waiting player for one slot of a locked preview
+  // group. Nothing has actually been played yet, so — unlike the live
+  // court editor — there's no games_played/pairing-history bookkeeping
+  // here, just the stored grouping itself.
+  async function handleReplacePreviewPlayer(groupIndex: number, slot: number, incomingId: number) {
+    if (previewEditBusy) return;
+    setPreviewEditBusy(true);
+
+    try {
+      const incoming = playersRef.current.find((p) => p.id === incomingId);
+      const current = lockedGroupsRef.current[groupIndex];
+      if (!incoming || !current) return;
+
+      const updatedGroup = current.map((p, i) => (i === slot ? incoming : p));
+      const updated = lockedGroupsRef.current.map((g, i) => (i === groupIndex ? updatedGroup : g));
+
+      lockedGroupsRef.current = updated;
+      setLockedGroups(updated);
+      await saveLockedGroups(updated);
+    } finally {
+      setPreviewEditBusy(false);
+      setPreviewEditAction(null);
+    }
+  }
+
+  // Swaps two positions within the same locked preview group (changes
+  // which side of the future court each player would end up on, and
+  // therefore who partners with whom).
+  async function handleSwapPreviewPlayers(groupIndex: number, indexA: number, indexB: number) {
+    if (indexA === indexB || previewEditBusy) return;
+    setPreviewEditBusy(true);
+
+    try {
+      const current = lockedGroupsRef.current[groupIndex];
+      if (!current) return;
+
+      const reordered = [...current];
+      [reordered[indexA], reordered[indexB]] = [reordered[indexB], reordered[indexA]];
+      const updated = lockedGroupsRef.current.map((g, i) => (i === groupIndex ? reordered : g));
+
+      lockedGroupsRef.current = updated;
+      setLockedGroups(updated);
+      await saveLockedGroups(updated);
+    } finally {
+      setPreviewEditBusy(false);
+      setPreviewEditAction(null);
+    }
+  }
+
   async function handleResetSession() {
     const userId = session.user.id;
 
@@ -1298,11 +1516,17 @@ function Dashboard({ session }: DashboardProps) {
         .delete()
         .eq('owner_id', userId);
 
+      const { error: resetLockedQueueError } = await supabase
+        .from('locked_queue')
+        .delete()
+        .eq('owner_id', userId);
+
       if (deletePlayersError) console.error('Error clearing players:', deletePlayersError);
       if (resetCourtsError) console.error('Error resetting courts:', resetCourtsError);
       if (resetSessionError) console.error('Error resetting session state:', resetSessionError);
       if (resetHistoryError) console.error('Error clearing group history:', resetHistoryError);
       if (resetMatchesError) console.error('Error clearing matches:', resetMatchesError);
+      if (resetLockedQueueError) console.error('Error clearing locked queue:', resetLockedQueueError);
 
       await loadData();
     });
@@ -1351,6 +1575,8 @@ function Dashboard({ session }: DashboardProps) {
       playersRef.current = updated;
       setPlayers(updated);
       setPairingSourceId(null);
+
+      await refreshAndPersistLockedGroups();
     });
   }
 
@@ -1375,6 +1601,8 @@ function Dashboard({ session }: DashboardProps) {
 
       playersRef.current = updated;
       setPlayers(updated);
+
+      await refreshAndPersistLockedGroups();
     });
   }
 
@@ -1404,15 +1632,6 @@ function Dashboard({ session }: DashboardProps) {
     .filter((p) => p.name.toLowerCase().includes(leaderboardSearch.trim().toLowerCase()))
     .sort((a, b) => b.gamesPlayed - a.gamesPlayed);
 
-  // Rank is computed against the whole roster first, so a player keeps
-  // their true rank number even while the search box is filtering the list.
-  const winLeaderboardResults = [...allPlayers]
-    .sort(compareByRecord)
-    .map((player, index) => ({ player, rank: index + 1 }))
-    .filter(({ player }) =>
-      player.name.toLowerCase().includes(winLeaderboardSearch.trim().toLowerCase())
-    );
-
   // Court editor derived values. The editor only opens for a court with a
   // full group of 4 on it.
   const foundEditingCourt = editingCourtId !== null ? courts.find((c) => c.id === editingCourtId) : undefined;
@@ -1441,6 +1660,37 @@ function Dashboard({ session }: DashboardProps) {
 
   const minCandidateGames = replaceCandidates.length > 0 ? replaceCandidates[0].gamesPlayed : 0;
   const hiddenCandidateCount = players.length - replaceCandidates.length;
+
+  // Preview editor derived values.
+  const editingPreviewGroup = editingPreviewIndex !== null ? lockedGroups[editingPreviewIndex] : undefined;
+  const previewReplaceSlot = previewEditAction?.type === 'replace' ? previewEditAction.slot : null;
+  const previewSwapSlot = previewEditAction?.type === 'swap' ? previewEditAction.slot : null;
+  const previewReplacedPlayer =
+    editingPreviewGroup && previewReplaceSlot !== null ? editingPreviewGroup[previewReplaceSlot] : undefined;
+
+  // A candidate can't already be reserved in THIS group or any OTHER
+  // locked preview group — that's what stops two stacks from silently
+  // sharing a player.
+  const previewOtherReservedIds = new Set(
+    lockedGroups.flatMap((g, idx) => (idx === editingPreviewIndex ? [] : g.map((p) => p.id)))
+  );
+  const previewCurrentGroupIds = new Set((editingPreviewGroup ?? []).map((p) => p.id));
+
+  const previewReplaceCandidates: Player[] =
+    editingPreviewGroup && previewReplaceSlot !== null
+      ? players
+          .filter(
+            (p) =>
+              !previewCurrentGroupIds.has(p.id) &&
+              !previewOtherReservedIds.has(p.id) &&
+              !(p.partnerId !== null && players.some((q) => q.id === p.partnerId)) &&
+              unitCompatibleWithGroup(
+                [p],
+                editingPreviewGroup.filter((_, i) => i !== previewReplaceSlot)
+              )
+          )
+          .sort((a, b) => a.gamesPlayed - b.gamesPlayed)
+      : [];
 
   return (
     <div className="relative min-h-screen bg-linear-to-b from-slate-100 via-emerald-50 to-teal-100 overflow-hidden">
@@ -1629,6 +1879,7 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         </div>
 
+        {/* FIFO mode: exact, guaranteed Upcoming Stacks — untouched */}
         {queueMode === 'fifo' && queueStacks.length > 0 && (
           <div className="mt-8">
             <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
@@ -1690,148 +1941,132 @@ function Dashboard({ session }: DashboardProps) {
           </div>
         )}
 
-        {/* Two dropdowns: Games Played + Leaderboard */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8 items-start">
-          {/* Games Played */}
-          <div>
-            <button
-              onClick={() => setShowLeaderboard((v) => !v)}
-              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
-            >
-              <span>📊 Games Played</span>
-              <svg
-                className={`w-4 h-4 transition-transform ${showLeaderboard ? 'rotate-180' : ''}`}
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-
-            {showLeaderboard && (
-              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
-                <div className="relative mb-3">
-                  <svg
-                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <circle cx="11" cy="11" r="7" />
-                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
-                  </svg>
-                  <input
-                    type="text"
-                    value={leaderboardSearch}
-                    onChange={(e) => setLeaderboardSearch(e.target.value)}
-                    placeholder="Search players..."
-                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
-                  />
-                </div>
-
-                {leaderboardResults.length === 0 ? (
-                  <p className="text-gray-300 text-sm">
-                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
-                  </p>
-                ) : (
-                  <ul className="space-y-2 max-h-64 overflow-y-auto">
-                    {leaderboardResults.map((player) => (
+        {/* Fair mode: editable, hard-locked preview */}
+        {queueMode === 'fair' && lockedGroups.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">
+              Upcoming Stacks{' '}
+              <span className="normal-case font-normal text-gray-400">
+                — locked in, plays exactly as shown
+              </span>
+            </h2>
+            <div className="flex gap-4 overflow-x-auto pb-2">
+              {lockedGroups.map((group, index) => (
+                <div
+                  key={index}
+                  className={`shrink-0 w-56 rounded-xl shadow-sm p-4 ${
+                    index === 0
+                      ? 'bg-linear-to-br from-green-500 to-emerald-600 text-white'
+                      : 'bg-white/90 backdrop-blur text-gray-800'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-3">
+                    <span
+                      className={`text-xs font-bold uppercase tracking-wide ${
+                        index === 0 ? 'text-green-100' : 'text-gray-400'
+                      }`}
+                    >
+                      Stack {index + 1}
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      {index === 0 && (
+                        <span className="text-[10px] font-bold bg-white/25 px-2 py-0.5 rounded-full">NEXT</span>
+                      )}
+                      <button
+                        onClick={() => openPreviewEditor(index)}
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full transition-colors ${
+                          index === 0
+                            ? 'bg-white/25 hover:bg-white/40 text-white'
+                            : 'bg-gray-100 hover:bg-gray-200 text-gray-600'
+                        }`}
+                      >
+                        ✎ Edit
+                      </button>
+                    </div>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {group.map((player, i) => (
                       <li
                         key={player.id}
-                        className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                        className={`text-sm font-medium truncate rounded-md px-2 py-1 flex items-center gap-1.5 ${
+                          index === 0 ? 'bg-white/15' : 'bg-gray-50'
+                        }`}
                       >
-                        <div className="flex items-center gap-2 min-w-0">
+                        <span>{i + 1}. {player.name}</span>
+                        <span className="ml-auto flex items-center gap-1">
                           <SkillBadge level={player.skillLevel} />
-                          <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
-                        </div>
-                        <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
+                        </span>
                       </li>
                     ))}
                   </ul>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Leaderboard — win-loss ranking */}
-          <div>
-            <button
-              onClick={() => setShowWinLeaderboard((v) => !v)}
-              className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
-            >
-              <span>🏆 Leaderboard</span>
-              <svg
-                className={`w-4 h-4 transition-transform ${showWinLeaderboard ? 'rotate-180' : ''}`}
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-
-            {showWinLeaderboard && (
-              <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
-                <div className="relative mb-3">
-                  <svg
-                    className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <circle cx="11" cy="11" r="7" />
-                    <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
-                  </svg>
-                  <input
-                    type="text"
-                    value={winLeaderboardSearch}
-                    onChange={(e) => setWinLeaderboardSearch(e.target.value)}
-                    placeholder="Search players..."
-                    className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
-                  />
                 </div>
-
-                {winLeaderboardResults.length === 0 ? (
-                  <p className="text-gray-300 text-sm">
-                    {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
-                  </p>
-                ) : (
-                  <ul className="space-y-2 max-h-64 overflow-y-auto">
-                    {winLeaderboardResults.map(({ player, rank }) => {
-                      const total = player.wins + player.losses;
-                      const pct = total > 0 ? Math.round((player.wins / total) * 100) : null;
-
-                      return (
-                        <li
-                          key={player.id}
-                          className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            <span className="text-xs font-bold text-gray-400 w-5 shrink-0">{rank}</span>
-                            <SkillBadge level={player.skillLevel} />
-                            <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
-                          </div>
-                          <div className="flex items-baseline gap-2 shrink-0">
-                            <span className="text-sm font-bold text-green-600 tabular-nums">
-                              {player.wins}-{player.losses}
-                            </span>
-                            <span className="text-xs text-gray-400 tabular-nums w-9 text-right">
-                              {pct === null ? '—' : `${pct}%`}
-                            </span>
-                          </div>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-              </div>
-            )}
+              ))}
+            </div>
           </div>
+        )}
+
+        {/* Games Played lookup */}
+        <div className="mt-8 max-w-md">
+          <button
+            onClick={() => setShowLeaderboard((v) => !v)}
+            className="w-full flex items-center justify-between text-sm font-bold text-gray-500 uppercase tracking-wide mb-3"
+          >
+            <span>📊 Games Played</span>
+            <svg
+              className={`w-4 h-4 transition-transform ${showLeaderboard ? 'rotate-180' : ''}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+
+          {showLeaderboard && (
+            <div className="bg-white/90 backdrop-blur rounded-xl shadow-sm p-4">
+              <div className="relative mb-3">
+                <svg
+                  className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                >
+                  <circle cx="11" cy="11" r="7" />
+                  <path strokeLinecap="round" d="M21 21l-4.3-4.3" />
+                </svg>
+                <input
+                  type="text"
+                  value={leaderboardSearch}
+                  onChange={(e) => setLeaderboardSearch(e.target.value)}
+                  placeholder="Search players..."
+                  className="w-full border border-gray-200 rounded-full pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                />
+              </div>
+
+              {leaderboardResults.length === 0 ? (
+                <p className="text-gray-300 text-sm">
+                  {allPlayers.length === 0 ? 'No players yet' : 'No matches'}
+                </p>
+              ) : (
+                <ul className="space-y-2 max-h-64 overflow-y-auto">
+                  {leaderboardResults.map((player) => (
+                    <li
+                      key={player.id}
+                      className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <SkillBadge level={player.skillLevel} />
+                        <span className="text-sm font-medium text-gray-800 truncate">{player.name}</span>
+                      </div>
+                      <span className="text-sm font-bold text-green-600 shrink-0">{player.gamesPlayed}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -2010,6 +2245,170 @@ function Dashboard({ session }: DashboardProps) {
                       {hiddenCandidateCount} other waiting player{hiddenCandidateCount === 1 ? '' : 's'} not shown —
                       skill mismatch, or part of a pair (unpair them in Manage Queue first).
                     </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fair-mode preview stack editor modal */}
+      {editingPreviewIndex !== null && editingPreviewGroup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={closePreviewEditor} />
+
+          <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto animate-modal-in">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 sticky top-0 bg-white z-10">
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-gray-800 truncate">Edit Stack {editingPreviewIndex + 1}</h2>
+                <p className="text-xs text-gray-400">
+                  This grouping is locked in — it will be used exactly as shown when a court opens.
+                </p>
+              </div>
+              <button
+                onClick={closePreviewEditor}
+                className="text-gray-400 hover:text-gray-600 w-8 h-8 rounded-full hover:bg-gray-100 flex items-center justify-center transition-colors shrink-0"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {previewSwapSlot !== null ? (
+                <p className="text-xs font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                  Choose who to swap {editingPreviewGroup[previewSwapSlot]?.name} with.
+                </p>
+              ) : previewReplaceSlot === null ? (
+                <p className="text-xs text-gray-500">
+                  <span className="font-semibold text-gray-700">Replace</span> swaps in a different waiting player.{' '}
+                  <span className="font-semibold text-gray-700">Swap</span> changes positions within this stack.
+                </p>
+              ) : null}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {[
+                  { label: 'Side A', slots: [0, 1] },
+                  { label: 'Side B', slots: [2, 3] },
+                ].map((team) => (
+                  <div key={team.label}>
+                    <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">{team.label}</h3>
+                    <ul className="space-y-2">
+                      {team.slots.map((slot) => {
+                        const player = editingPreviewGroup[slot];
+                        const isSource = previewReplaceSlot === slot || previewSwapSlot === slot;
+
+                        return (
+                          <li
+                            key={player.id}
+                            className={`rounded-lg border px-3 py-2 transition-colors ${
+                              previewReplaceSlot === slot
+                                ? 'border-green-500 bg-green-50'
+                                : previewSwapSlot === slot
+                                ? 'border-purple-400 bg-purple-50'
+                                : 'border-gray-200 bg-gray-50'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <SkillBadge level={player.skillLevel} />
+                                <span className="text-sm font-semibold text-gray-800 truncate">{player.name}</span>
+                              </div>
+                              <span className="shrink-0 text-xs font-semibold text-gray-500 bg-white border border-gray-200 rounded-full px-2 py-0.5">
+                                {player.gamesPlayed} {player.gamesPlayed === 1 ? 'game' : 'games'}
+                              </span>
+                            </div>
+
+                            <div className="flex gap-1.5 mt-2">
+                              {previewSwapSlot !== null && previewSwapSlot !== slot ? (
+                                <button
+                                  disabled={previewEditBusy}
+                                  onClick={() => handleSwapPreviewPlayers(editingPreviewIndex, previewSwapSlot, slot)}
+                                  className="flex-1 text-xs font-semibold bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-2.5 py-1.5 rounded-md transition-colors"
+                                >
+                                  Swap here
+                                </button>
+                              ) : isSource ? (
+                                <button
+                                  onClick={() => setPreviewEditAction(null)}
+                                  className="flex-1 text-xs font-semibold bg-gray-200 hover:bg-gray-300 text-gray-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                >
+                                  Cancel
+                                </button>
+                              ) : (
+                                <>
+                                  <button
+                                    disabled={previewEditBusy}
+                                    onClick={() => setPreviewEditAction({ type: 'replace', slot })}
+                                    className="flex-1 text-xs font-semibold bg-green-100 hover:bg-green-200 disabled:opacity-50 disabled:cursor-not-allowed text-green-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                  >
+                                    Replace
+                                  </button>
+                                  <button
+                                    disabled={previewEditBusy}
+                                    onClick={() => setPreviewEditAction({ type: 'swap', slot })}
+                                    className="flex-1 text-xs font-semibold bg-purple-100 hover:bg-purple-200 disabled:opacity-50 disabled:cursor-not-allowed text-purple-700 px-2.5 py-1.5 rounded-md transition-colors"
+                                  >
+                                    Swap
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+
+              {previewReplaceSlot !== null && previewReplacedPlayer && (
+                <div className="rounded-xl border border-green-200 bg-green-50/60 p-4">
+                  <div className="flex items-center justify-between mb-1">
+                    <h3 className="text-sm font-bold text-gray-800">Replace {previewReplacedPlayer.name} with…</h3>
+                    <button
+                      onClick={() => setPreviewEditAction(null)}
+                      className="text-xs font-semibold text-green-700 hover:text-green-900"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
+                  {previewReplaceCandidates.length === 0 ? (
+                    <p className="text-sm text-gray-500 bg-white rounded-lg px-3 py-3 border border-gray-100">
+                      No eligible players right now. Only waiting players not already reserved in another stack, not
+                      half of a waiting pair, and skill-compatible with the rest of this stack can be brought in.
+                    </p>
+                  ) : (
+                    <ul className="space-y-2 max-h-60 overflow-y-auto">
+                      {previewReplaceCandidates.map((candidate) => (
+                        <li
+                          key={candidate.id}
+                          className="flex items-center justify-between gap-2 bg-white rounded-lg px-3 py-2 border border-gray-100"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <SkillBadge level={candidate.skillLevel} />
+                            <span className="text-sm font-medium text-gray-800 truncate">{candidate.name}</span>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-xs font-bold text-gray-500 tabular-nums">
+                              {candidate.gamesPlayed} {candidate.gamesPlayed === 1 ? 'game' : 'games'}
+                            </span>
+                            <button
+                              disabled={previewEditBusy}
+                              onClick={() =>
+                                handleReplacePreviewPlayer(editingPreviewIndex, previewReplaceSlot, candidate.id)
+                              }
+                              className="text-xs font-semibold bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded-md transition-colors"
+                            >
+                              Bring in
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               )}

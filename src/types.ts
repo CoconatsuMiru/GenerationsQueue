@@ -75,3 +75,8 @@ export interface DbMatch {
   winner_team: 'a' | 'b';
   created_at: string;
 }
+
+export interface DbLockedQueue {
+  owner_id: string;
+  groups: number[][];
+}
