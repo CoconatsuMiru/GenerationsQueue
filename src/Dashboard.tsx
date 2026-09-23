@@ -14,7 +14,7 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-const LOCKED_PREVIEW_COUNT = 3;
+const LOCKED_PREVIEW_COUNT = 5;
 
 interface DashboardProps {
   session: Session;
@@ -500,6 +500,7 @@ function Dashboard({ session }: DashboardProps) {
     if (editingCourtId === null) return;
     const court = courts.find((c) => c.id === editingCourtId);
     if (!court || court.players.length < 4) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditingCourtId(null);
       setEditAction(null);
     }
@@ -512,6 +513,7 @@ function Dashboard({ session }: DashboardProps) {
     if (editingPreviewIndex === null) return;
     const group = lockedGroups[editingPreviewIndex];
     if (!group || group.length < 4) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditingPreviewIndex(null);
       setPreviewEditAction(null);
     }
@@ -564,6 +566,7 @@ function Dashboard({ session }: DashboardProps) {
       console.error('SESSION READ ERROR:', sessionReadError);
     }
 
+    // eslint-disable-next-line no-useless-assignment
     let sessionActive = false;
     let isNewAccount = false;
 
@@ -698,6 +701,7 @@ function Dashboard({ session }: DashboardProps) {
   }
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
