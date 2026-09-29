@@ -14,7 +14,7 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-const LOCKED_PREVIEW_COUNT = 0;
+const LOCKED_PREVIEW_COUNT = 1;
 
 interface DashboardProps {
   session: Session;
@@ -376,7 +376,9 @@ function refreshLockedGroups(
   groupHistory: Map<string, number>
 ): Player[][] {
   const waitingIds = new Set(waitingPlayers.map((p) => p.id));
-  const valid = currentLocked.filter((group) => group.every((p) => waitingIds.has(p.id)));
+  const valid = currentLocked
+    .filter((group) => group.every((p) => waitingIds.has(p.id)))
+    .slice(0, LOCKED_PREVIEW_COUNT);
 
   const reservedIds = new Set(valid.flatMap((g) => g.map((p) => p.id)));
   const pool = waitingPlayers.filter((p) => !reservedIds.has(p.id));
