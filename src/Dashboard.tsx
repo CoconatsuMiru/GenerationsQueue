@@ -14,7 +14,7 @@ const OVERTIME_MINUTES = 2;
 const MAX_QUEUE_STACKS = 10;
 const ANNOUNCE_PAUSE_MS = 1500;
 const FIRST_CALL_REPEAT_PAUSE_MS = 400;
-const LOCKED_PREVIEW_COUNT = 1;
+const LOCKED_PREVIEW_COUNT = 0;
 
 interface DashboardProps {
   session: Session;
